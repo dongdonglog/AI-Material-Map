@@ -58,6 +58,12 @@ export async function closeApp(launched: LaunchedApp | null): Promise<void> {
   rmSync(launched.workspaceRoot, { recursive: true, force: true })
 }
 
+export async function openWorkspaceWindow(window: Page, workspaceRoot: string): Promise<void> {
+  await window.reload()
+  await window.locator('button', { hasText: workspaceRoot }).click()
+  await window.locator('.app-shell').waitFor()
+}
+
 /** 在临时目录创建工作区并注入两份互相关联的材料 */
 export async function seedWorkspace(window: Page, workspaceRoot: string): Promise<void> {
   await window.evaluate(async (root) => {

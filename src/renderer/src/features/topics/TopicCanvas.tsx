@@ -6,9 +6,12 @@ import { layoutTopic } from '../../lib/topic-layout'
 import { BoardToolbar } from './BoardToolbar'
 import { MaterialNode, type MaterialNodeData } from './MaterialNode'
 import { RelationEdge } from './RelationEdge'
+import { ProposalEdge, ProposalNode, WorkstreamContainerNode, type ProposalNodeData, type WorkstreamContainerNodeData } from './ProposalOverlay'
 import { ipc } from '../../lib/ipc'
 import { useTopicConnections } from './useTopicConnections'
 import { DemoChecklist } from './DemoChecklist'
+import { projectCanvasDiff } from './canvas-diff'
+import { projectWorkstreamContainers } from './workstream-containers'
 import { stableTopicOrder } from '../../../../shared/topic-topology'
 import { requiresCloudConsent } from '../../../../shared/ai-provider'
 import type { Point, Rect } from '../../lib/topic-edge-routing'
@@ -17,8 +20,9 @@ import './topic-canvas.css'
 
 type Menu = { x: number; y: number; position: Point; nodeIds: string[]; edgeIds: string[] } | null
 type EditorCommand = { kind: string; payload: Record<string, unknown> }
-const nodeTypes = { material: MaterialNode }
-const edgeTypes = { relation: RelationEdge }
+type CanvasNodeData = MaterialNodeData | ProposalNodeData | WorkstreamContainerNodeData
+const nodeTypes = { material: MaterialNode, proposal: ProposalNode, workstream: WorkstreamContainerNode }
+const edgeTypes = { relation: RelationEdge, proposal: ProposalEdge }
 
 const sameIds = (left: string[], right: string[]): boolean => left.length === right.length && left.every((id, index) => id === right[index])
 const inputTarget = (target: EventTarget | null): boolean => target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement || (target instanceof HTMLElement && target.isContentEditable)
@@ -34,8 +38,9 @@ export function TopicCanvas({ map, materials, onRefresh, onImportFiles }: { map:
   const { t } = useI18n()
   const [viewMode, setViewMode] = useState<'map' | 'flow'>(map.topic.viewMode ?? 'map')
   const [confirmedOnly, setConfirmedOnly] = useState(Boolean(map.topic.confirmedOnly))
-  const [focusedWorkstreamId, setFocusedWorkstreamId] = useState<string | null>(null)
-  const [collapsedWorkstreams, setCollapsedWorkstreams] = useState<string[]>([])
+  const [focusedWorkstreamId, setFocusedWorkstreamId] = useState<string | null>(map.topic.focusedWorkstreamId ?? null)
+  const [selectionFocus, setSelectionFocus] = useState(false)
+  const [selectedNodeIds, setSelectedNodeIds] = useState<string[]>([])
   const [aiOpen, setAiOpen] = useState(false)
   const [aiInstruction, setAiInstruction] = useState(() => t('canvas.defaultInstruction'))
   const [aiAllowCloud, setAiAllowCloud] = useState(false)
@@ -52,26 +57,44 @@ export function TopicCanvas({ map, materials, onRefresh, onImportFiles }: { map:
   const [pickedIds, setPickedIds] = useState<string[]>([])
   const [proposals, setProposals] = useState<TopicProposal[]>([])
   const [proposalsOpen, setProposalsOpen] = useState(false)
-  const [flow, setFlow] = useState<ReactFlowInstance<Node<MaterialNodeData>, Edge> | null>(null)
+  const [flow, setFlow] = useState<ReactFlowInstance<Node<CanvasNodeData>, Edge> | null>(null)
   const didFit = useRef(false)
   const commandTail = useRef(Promise.resolve())
   const deleteSelectionRef = useRef<(nodeIds: string[], edgeIds: string[]) => void>(() => undefined)
   const selectionRef = useRef<{ nodeIds: string[]; edgeIds: string[] }>({ nodeIds: [], edgeIds: [] })
   const contextSelectionRef = useRef<{ nodeIds: string[]; edgeIds: string[] } | null>(null)
   const programmaticSelectionRef = useRef(0)
-  const [nodes, setNodes, onNodesChange] = useNodesState<Node<MaterialNodeData>>([])
+  const [nodes, setNodes, onNodesChange] = useNodesState<Node<CanvasNodeData>>([])
   const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>([])
   const ordered = useMemo(() => stableTopicOrder(map.materials.map((material) => ({ ...material, occurredAt: material.occurredAt ?? null, importedAt: material.importedAt ?? '', sequence: material.sequence ?? null, sequenceSource: material.sequenceSource ?? 'time', addedAt: material.addedAt ?? null }))), [map.materials])
+  const selectionFocusIds = useMemo(() => {
+    if (!selectionFocus || !selectedNodeIds.length) return null
+    const ids = new Set(selectedNodeIds)
+    for (const relation of map.relations) {
+      if (ids.has(relation.sourceMaterialId)) ids.add(relation.targetMaterialId)
+      if (ids.has(relation.targetMaterialId)) ids.add(relation.sourceMaterialId)
+    }
+    return ids
+  }, [map.relations, selectedNodeIds, selectionFocus])
   const hiddenMaterialIds = useMemo(() => new Set(map.materials.filter((material) => {
     const workstreamId = material.workstreamId ?? null
     if (focusedWorkstreamId && workstreamId !== focusedWorkstreamId) return true
-    return Boolean(workstreamId && collapsedWorkstreams.includes(workstreamId))
-  }).map((material) => material.id)), [collapsedWorkstreams, focusedWorkstreamId, map.materials])
+    if (workstreamId && map.workstreams.find((stream) => stream.id === workstreamId)?.collapsed) return true
+    return Boolean(selectionFocusIds && !selectionFocusIds.has(material.id))
+  }).map((material) => material.id)), [focusedWorkstreamId, map.materials, map.workstreams, selectionFocusIds])
+  const workstreamContainers = useMemo(() => projectWorkstreamContainers(map), [map])
+  const proposalDiff = useMemo(() => projectCanvasDiff(map, proposals), [map, proposals])
+  const proposalNodes = useMemo((): Node<CanvasNodeData>[] => [
+    ...proposalDiff.workstreams.map((workstream): Node<CanvasNodeData> => ({ id: workstream.id, type: 'workstream', position: { x: workstream.x, y: workstream.y }, selectable: false, draggable: false, connectable: false, focusable: false, style: { width: workstream.width, height: workstream.height, zIndex: 0, pointerEvents: 'none' }, data: { name: workstream.name, color: workstream.color, memberCount: workstream.materialIds.length, collapsed: false, pending: true, reason: workstream.reason } })),
+    ...proposalDiff.cards.map((card): Node<CanvasNodeData> => ({ id: card.id, type: 'proposal', position: { x: card.x, y: card.y }, selectable: false, draggable: false, connectable: false, focusable: false, style: { zIndex: 4, pointerEvents: 'none' }, data: { title: card.title, detail: card.detail, kind: card.kind, color: card.color } }))
+  ], [proposalDiff.cards, proposalDiff.workstreams])
+  const proposalEdges = useMemo((): Edge[] => proposalDiff.relations.map((relation) => ({ id: relation.id, source: relation.source, target: relation.target, sourceHandle: 'out-right', targetHandle: 'in-left', type: 'proposal', selectable: false, focusable: false, data: { label: relation.label, kind: relation.kind, reason: relation.reason } })), [proposalDiff.relations])
   const loadProposals = useCallback(async (): Promise<void> => { setProposals(await ipc.topic.proposals(map.topic.id) as TopicProposal[]) }, [map.topic.id])
 
   const setSelection = useCallback((nodeIds: string[], edgeIds: string[]): void => {
     if (sameIds(selectionRef.current.nodeIds, nodeIds) && sameIds(selectionRef.current.edgeIds, edgeIds)) return
     selectionRef.current = { nodeIds, edgeIds }
+    setSelectedNodeIds(nodeIds)
     setSelectedCardId(nodeIds.length === 1 && edgeIds.length === 0 ? nodeIds[0] : null)
     setSelectedRelationId(nodeIds.length === 0 && edgeIds.length === 1 ? edgeIds[0] : null)
   }, [])
@@ -122,7 +145,8 @@ export function TopicCanvas({ map, materials, onRefresh, onImportFiles }: { map:
   useEffect(() => {
     setViewMode(map.topic.viewMode ?? 'map')
     setConfirmedOnly(Boolean(map.topic.confirmedOnly))
-  }, [map.topic.id, map.topic.viewMode, map.topic.confirmedOnly])
+    setFocusedWorkstreamId(map.topic.focusedWorkstreamId ?? null)
+  }, [map.topic.id, map.topic.viewMode, map.topic.confirmedOnly, map.topic.focusedWorkstreamId])
   useEffect(() => {
     if (!aiOpen) return
     void window.materialMap.settings.get().then((settings: ModelSettings) => {
@@ -159,13 +183,26 @@ export function TopicCanvas({ map, materials, onRefresh, onImportFiles }: { map:
   }, [undo, redo])
 
   useEffect(() => {
-    setNodes((current) => ordered.map((material, index) => {
+    setNodes(() => {
+      const containers = workstreamContainers.map((container): Node<CanvasNodeData> => ({
+        id: container.id,
+        type: 'workstream',
+        position: { x: container.x, y: container.y },
+        hidden: viewMode === 'flow' || Boolean(focusedWorkstreamId && container.workstream.id !== focusedWorkstreamId),
+        draggable: false,
+        selectable: false,
+        connectable: false,
+        focusable: false,
+        style: { width: container.width, height: container.height, zIndex: -1, pointerEvents: 'none' },
+        data: { name: container.workstream.name, color: container.workstream.color, memberCount: container.memberCount, collapsed: container.workstream.collapsed }
+      }))
+      const materialNodes = ordered.map((material, index): Node<CanvasNodeData> => {
       const stored = { x: material.canvasX ?? 120 + (index % 4) * 340, y: material.canvasY ?? 100 + Math.floor(index / 4) * 210 }
       // The server is refreshed only when an operation has committed. Its
       // position is therefore authoritative and makes undo/redo immediately
       // visible instead of preserving a stale local drag position.
       const position = stored
-      return { id: material.id, type: 'material', position, hidden: hiddenMaterialIds.has(material.id), selected: selectionRef.current.nodeIds.includes(material.id), style: { zIndex: material.cardZIndex ?? 0 }, data: {
+      return { id: material.id, type: 'material', position, hidden: hiddenMaterialIds.has(material.id), selected: selectionRef.current.nodeIds.includes(material.id), style: { zIndex: 2 + (material.cardZIndex ?? 0) }, data: {
         material, index, connecting: true, workstreamName: map.workstreams.find((stream) => stream.id === material.workstreamId)?.name,
         select: () => applySelection([material.id], []),
         context: (x: number, y: number) => {
@@ -177,8 +214,10 @@ export function TopicCanvas({ map, materials, onRefresh, onImportFiles }: { map:
           setMenu({ x, y, position, nodeIds, edgeIds })
         }
       } }
-    }))
-  }, [applySelection, hiddenMaterialIds, map.workstreams, ordered, setNodes])
+      })
+      return [...containers, ...materialNodes]
+    })
+  }, [applySelection, focusedWorkstreamId, hiddenMaterialIds, map.workstreams, ordered, setNodes, viewMode, workstreamContainers])
 
   useEffect(() => {
     const visible = map.relations.filter((relation) => !relation.archived && !hiddenMaterialIds.has(relation.sourceMaterialId) && !hiddenMaterialIds.has(relation.targetMaterialId) && (!confirmedOnly || relation.createdBy !== 'system') && (viewMode === 'map' || ['next', 'depends_on', 'blocks', 'implements', 'tests'].includes(relation.relationType)))
@@ -186,7 +225,10 @@ export function TopicCanvas({ map, materials, onRefresh, onImportFiles }: { map:
     for (const relation of visible) { const key = [relation.sourceMaterialId, relation.targetMaterialId].sort().join('::'); pairGroups.set(key, [...(pairGroups.get(key) ?? []), relation]) }
     const parallelOf = new Map<string, { index: number; count: number }>()
     for (const group of pairGroups.values()) [...group].sort((left, right) => left.createdAt.localeCompare(right.createdAt)).forEach((relation, index) => parallelOf.set(relation.id, { index, count: group.length }))
-    const cardBounds = new Map(nodes.map((node) => [node.id, { x: node.position.x, y: node.position.y, width: node.measured?.width ?? (node.data.material.cardWidth ?? 220), height: node.measured?.height ?? (node.data.material.cardHeight ?? 116) }]))
+    const cardBounds = new Map(nodes.filter((node) => node.type === 'material').map((node) => {
+      const material = (node.data as MaterialNodeData).material
+      return [node.id, { x: node.position.x, y: node.position.y, width: node.measured?.width ?? (material.cardWidth ?? 220), height: node.measured?.height ?? (material.cardHeight ?? 116) }]
+    }))
     setEdges(visible.map((relation): Edge => ({ id: relation.id, source: relation.sourceMaterialId, target: relation.targetMaterialId, sourceHandle: relation.sourceHandle ?? 'out-right', targetHandle: relation.targetHandle ?? 'in-left', type: 'relation', selected: selectionRef.current.edgeIds.includes(relation.id), data: {
       relation,
       parallel: parallelOf.get(relation.id) ?? { index: 0, count: 1 },
@@ -218,7 +260,7 @@ export function TopicCanvas({ map, materials, onRefresh, onImportFiles }: { map:
   useEffect(() => {
     if (viewMode === 'map') {
       const stored = new Map(ordered.map((material, index) => [material.id, { x: material.canvasX ?? 120 + (index % 4) * 340, y: material.canvasY ?? 100 + Math.floor(index / 4) * 210 }]))
-      setNodes((current) => current.map((node) => ({ ...node, position: stored.get(node.id) ?? node.position })))
+      setNodes((current) => current.map((node) => node.type === 'material' ? { ...node, position: stored.get(node.id) ?? node.position } : node))
       return
     }
     // Flow view is a layout mode for the current topic, so every visible
@@ -233,6 +275,14 @@ export function TopicCanvas({ map, materials, onRefresh, onImportFiles }: { map:
     const next = !confirmedOnly
     setConfirmedOnly(next)
     void ipc.topic.updateView(map.topic.id, { confirmedOnly: next }).catch((error: unknown) => setNotice(error instanceof Error ? error.message : 'Unable to persist relation filter.'))
+  }
+  const focusWorkstream = (workstreamId: string | null): void => {
+    const next = focusedWorkstreamId === workstreamId ? null : workstreamId
+    setFocusedWorkstreamId(next)
+    void ipc.topic.updateView(map.topic.id, { focusedWorkstreamId: next }).catch((error: unknown) => setNotice(error instanceof Error ? error.message : 'Unable to persist workstream focus.'))
+  }
+  const toggleWorkstreamCollapse = (workstream: TopicMap['workstreams'][number]): void => {
+    void ipc.workstream.presentation(workstream.id, { collapsed: !workstream.collapsed }).then(() => onRefresh()).catch((error: unknown) => setNotice(error instanceof Error ? error.message : 'Unable to persist workstream state.'))
   }
   const generateAiPlan = async (): Promise<void> => {
     const instruction = aiInstruction.trim()
@@ -324,11 +374,11 @@ export function TopicCanvas({ map, materials, onRefresh, onImportFiles }: { map:
     const selection = takeContextSelection() ?? (selectionContains(event.clientX, event.clientY) ? activeSelection() : { nodeIds: [], edgeIds: [] })
     setMenu({ x: event.clientX, y: event.clientY, position, ...selection })
   }
-  const openSelectionMenu = (event: ReactMouseEvent, selectedNodes: Node<MaterialNodeData>[]): void => {
+  const openSelectionMenu = (event: ReactMouseEvent, selectedNodes: Node<CanvasNodeData>[]): void => {
     event.preventDefault(); event.stopPropagation()
     const captured = takeContextSelection()
     const current = activeSelection()
-    const nodeIds = captured?.nodeIds ?? (current.nodeIds.length || current.edgeIds.length ? current.nodeIds : selectedNodes.map((node) => node.id))
+    const nodeIds = captured?.nodeIds ?? (current.nodeIds.length || current.edgeIds.length ? current.nodeIds : selectedNodes.filter((node) => node.type === 'material').map((node) => node.id))
     const edgeIds = captured?.edgeIds ?? current.edgeIds
     setSelection(nodeIds, edgeIds)
     setMenu({ x: event.clientX, y: event.clientY, position: flow?.screenToFlowPosition({ x: event.clientX, y: event.clientY }) ?? { x: 160, y: 120 }, nodeIds, edgeIds })
@@ -347,6 +397,15 @@ export function TopicCanvas({ map, materials, onRefresh, onImportFiles }: { map:
       setNotice(`Applied ${ids.length} proposal action(s). Undo is available.`)
     } catch (error) { setNotice(error instanceof Error ? error.message : 'Unable to apply proposals atomically.') }
   }
+  const ignoreAllProposals = async (): Promise<void> => {
+    const ids = proposals.filter((proposal) => proposal.status === 'pending').map((proposal) => proposal.id).slice(0, 64)
+    if (!ids.length) { setNotice(t('canvas.noProposalsToIgnore')); return }
+    try {
+      await ipc.topic.archiveProposals(map.topic.id, ids)
+      await loadProposals()
+      setNotice(t('canvas.ignoredProposals', { count: ids.length }))
+    } catch (error) { setNotice(error instanceof Error ? error.message : 'Unable to ignore proposals atomically.') }
+  }
   const reviewProposal = async (proposalId: string, decision: 'accept' | 'archive'): Promise<void> => {
     try {
       if (decision === 'accept') { await ipc.topic.acceptProposal(map.topic.id, proposalId); await onRefresh(); setNotice('已应用操作，可使用撤销恢复。') }
@@ -357,24 +416,24 @@ export function TopicCanvas({ map, materials, onRefresh, onImportFiles }: { map:
 
   return <section className="topic-view"><div className="topic-toolbar"><div><span className="view-pill">{t('canvas.title')}</span><p>{t('canvas.subtitle')}</p></div></div><DemoChecklist map={map} onReset={() => { if (window.confirm('重置学习路径演示？演示中的卡片位置和关系会恢复为标准流程。')) void window.materialMap.demo.create().then(onRefresh) }} />
     {notice && <div className="canvas-notice">{notice}<button onClick={() => setNotice('')}>{t('canvas.close')}</button></div>}
-    <div className={`whiteboard ${selectedCard || selectedRelation || proposalsOpen ? 'with-inspector' : ''}`}><BoardToolbar onAdd={() => void addCard({ x: 180, y: 140 })} onImport={() => void ipc.material.chooseFiles().then((paths: string[]) => onImportFiles(paths, { x: 180, y: 140 }))} onLayout={() => void autoLayout()} onFit={() => flow?.fitView({ padding: .18 })} onUndo={undo} onRedo={redo} onProposals={() => { const next = !proposalsOpen; setProposalsOpen(next); if (next) { applySelection([], []); setMenu(null) } }} proposalCount={proposals.length} proposalsOpen={proposalsOpen} canUndo={history.undo} canRedo={history.redo} />
-      <div className="whiteboard-stage" tabIndex={0} onPointerDownCapture={captureContextSelection} onPaste={(event) => { if (inputTarget(event.target)) return; const text = event.clipboardData.getData('text/plain'); if (!text) return; event.preventDefault(); void pasteCard({ x: 160, y: 120 }, text) }}><div className="flow-map"><ReactFlow nodes={nodes} edges={edges} nodeTypes={nodeTypes} edgeTypes={edgeTypes} onNodesChange={onNodesChange} onEdgesChange={onEdgesChange} onSelectionChange={({ nodes: selectedNodes, edges: selectedEdges }) => { if (!programmaticSelectionRef.current) setSelection(selectedNodes.map((node) => node.id), selectedEdges.map((edge) => edge.id)) }} onSelectionContextMenu={openSelectionMenu} onConnect={(connection) => void connect(connection)} isValidConnection={(connection) => !validConnection(connection)} onNodeClick={(_event, node) => { setProposalsOpen(false); applySelection([node.id], []) }} onNodeContextMenu={(event, node) => { event.preventDefault(); setProposalsOpen(false); const captured = takeContextSelection(); const current = activeSelection(); const nodeIds = captured?.nodeIds.includes(node.id) ? captured.nodeIds : current.nodeIds.includes(node.id) ? current.nodeIds : [node.id]; const edgeIds = captured?.nodeIds.includes(node.id) ? captured.edgeIds : []; applySelection(nodeIds, edgeIds); setMenu({ x: event.clientX, y: event.clientY, position: node.position, nodeIds, edgeIds }) }} onEdgeClick={(_event, edge) => { setProposalsOpen(false); applySelection([], [edge.id]) }} onEdgeContextMenu={(event, edge) => { event.preventDefault(); setProposalsOpen(false); const captured = takeContextSelection(); const current = activeSelection(); const edgeIds = captured?.edgeIds.includes(edge.id) ? captured.edgeIds : current.edgeIds.includes(edge.id) ? current.edgeIds : [edge.id]; const nodeIds = captured?.edgeIds.includes(edge.id) ? captured.nodeIds : []; applySelection(nodeIds, edgeIds); setMenu({ x: event.clientX, y: event.clientY, position: { x: 0, y: 0 }, nodeIds, edgeIds }) }} onNodeDragStop={(_event, node) => { const selected = activeSelection().nodeIds.includes(node.id) ? nodes.filter((item) => activeSelection().nodeIds.includes(item.id)) : [node]; void runCommand({ kind: 'moveCards', payload: { positions: selected.map((item) => ({ materialId: item.id, x: item.position.x, y: item.position.y })) } }) }} onPaneContextMenu={openPaneMenu} onPaneClick={() => { applySelection([], []); setMenu(null) }} onInit={(instance) => { setFlow(instance); if (!didFit.current) { didFit.current = true; requestAnimationFrame(() => instance.fitView({ padding: .18 })) } }} panOnDrag={[2]} panActivationKeyCode="Space" panOnScroll selectionOnDrag selectionMode={SelectionMode.Partial} selectionKeyCode={null} deleteKeyCode={null} multiSelectionKeyCode={["Meta", "Control"]} connectOnClick={false}>
+    <div className={`whiteboard ${selectedCard || selectedRelation || proposalsOpen ? 'with-inspector' : ''}`}><BoardToolbar onAdd={() => void addCard({ x: 180, y: 140 })} onImport={() => void ipc.material.chooseFiles().then((paths: string[]) => onImportFiles(paths, { x: 180, y: 140 }))} onLayout={() => void autoLayout()} onFit={() => flow?.fitView({ padding: .18 })} onUndo={undo} onRedo={redo} onProposals={() => { const next = !proposalsOpen; setProposalsOpen(next); if (next) { applySelection([], []); setMenu(null) } }} onToggleSelectionFocus={() => setSelectionFocus((current) => !current)} selectionFocus={selectionFocus} proposalCount={proposals.length} proposalsOpen={proposalsOpen} canUndo={history.undo} canRedo={history.redo} />
+      <div className="whiteboard-stage" tabIndex={0} onPointerDownCapture={captureContextSelection} onPaste={(event) => { if (inputTarget(event.target)) return; const text = event.clipboardData.getData('text/plain'); if (!text) return; event.preventDefault(); void pasteCard({ x: 160, y: 120 }, text) }}><div className="flow-map"><ReactFlow nodes={[...nodes, ...proposalNodes]} edges={[...edges, ...proposalEdges]} nodeTypes={nodeTypes} edgeTypes={edgeTypes} onNodesChange={onNodesChange} onEdgesChange={onEdgesChange} onSelectionChange={({ nodes: selectedNodes, edges: selectedEdges }) => { if (!programmaticSelectionRef.current) setSelection(selectedNodes.filter((node) => node.type === 'material').map((node) => node.id), selectedEdges.filter((edge) => edge.type !== 'proposal').map((edge) => edge.id)) }} onSelectionContextMenu={openSelectionMenu} onConnect={(connection) => void connect(connection)} isValidConnection={(connection) => !validConnection(connection)} onNodeClick={(_event, node) => { setProposalsOpen(false); applySelection([node.id], []) }} onNodeContextMenu={(event, node) => { event.preventDefault(); setProposalsOpen(false); const captured = takeContextSelection(); const current = activeSelection(); const nodeIds = captured?.nodeIds.includes(node.id) ? captured.nodeIds : current.nodeIds.includes(node.id) ? current.nodeIds : [node.id]; const edgeIds = captured?.nodeIds.includes(node.id) ? captured.edgeIds : []; applySelection(nodeIds, edgeIds); setMenu({ x: event.clientX, y: event.clientY, position: node.position, nodeIds, edgeIds }) }} onEdgeClick={(_event, edge) => { setProposalsOpen(false); applySelection([], [edge.id]) }} onEdgeContextMenu={(event, edge) => { event.preventDefault(); setProposalsOpen(false); const captured = takeContextSelection(); const current = activeSelection(); const edgeIds = captured?.edgeIds.includes(edge.id) ? captured.edgeIds : current.edgeIds.includes(edge.id) ? current.edgeIds : [edge.id]; const nodeIds = captured?.edgeIds.includes(edge.id) ? captured.nodeIds : []; applySelection(nodeIds, edgeIds); setMenu({ x: event.clientX, y: event.clientY, position: { x: 0, y: 0 }, nodeIds, edgeIds }) }} onNodeDragStop={(_event, node) => { const selected = activeSelection().nodeIds.includes(node.id) ? nodes.filter((item) => activeSelection().nodeIds.includes(item.id)) : [node]; void runCommand({ kind: 'moveCards', payload: { positions: selected.map((item) => ({ materialId: item.id, x: item.position.x, y: item.position.y })) } }) }} onPaneContextMenu={openPaneMenu} onPaneClick={() => { applySelection([], []); setMenu(null) }} onInit={(instance) => { setFlow(instance); if (!didFit.current) { didFit.current = true; requestAnimationFrame(() => instance.fitView({ padding: .18 })) } }} panOnDrag={[2]} panActivationKeyCode="Space" panOnScroll selectionOnDrag selectionMode={SelectionMode.Partial} selectionKeyCode={null} deleteKeyCode={null} multiSelectionKeyCode={["Meta", "Control"]} connectOnClick={false}>
         <Background gap={20} /><MiniMap pannable zoomable /><Controls showInteractive={false} />
       </ReactFlow></div></div>
       {selectedCard && <CardInspector material={selectedCard} onClose={() => { applySelection([], []); setMenu(null) }} onPatchCard={(materialId, patch) => void runCommand({ kind: 'patchCard', payload: { materialId, patch } })} onDeleteCard={(materialId) => void deleteSelection([materialId], [])} />}
       {selectedRelation && <EditorInspector relation={selectedRelation} materials={map.materials} onClose={() => { applySelection([], []); setMenu(null) }} onRenameRelation={(relationId, label) => void runCommand({ kind: 'renameRelation', payload: { relationId, label } })} onPatchRelation={(relationId, patch) => void runCommand({ kind: 'patchRelationStyle', payload: { relationId, patch } })} onReverseRelation={(relation) => void runCommand({ kind: 'reconnectRelation', payload: { relationId: relation.id, sourceMaterialId: relation.targetMaterialId, targetMaterialId: relation.sourceMaterialId, sourceHandle: outputHandle(relation.targetHandle, 'left'), targetHandle: inputHandle(relation.sourceHandle, 'right') } })} onDeleteRelation={(relationId) => void deleteSelection([], [relationId])} />}
-      {proposalsOpen && <ProposalInspector proposals={proposals} map={map} onClose={() => setProposalsOpen(false)} onReview={(proposalId, decision) => void reviewProposal(proposalId, decision)} />}
+      {proposalsOpen && <ProposalInspector proposals={proposals} map={map} planSummary={aiPlan?.summary ?? null} diffCounts={proposalDiff.counts} onClose={() => setProposalsOpen(false)} onReview={(proposalId, decision) => void reviewProposal(proposalId, decision)} onReviewAll={() => void reviewAllProposals()} onIgnoreAll={() => void ignoreAllProposals()} />}
     </div>
     {menu && <div className="canvas-menu" style={{ left: menu.x, top: menu.y }}>{menu.nodeIds.length || menu.edgeIds.length ? <>{menu.edgeIds.length === 1 && !menu.nodeIds.length && <button onClick={() => { applySelection([], menu.edgeIds); setMenu(null) }}>{t('canvas.openRelationProperties')}</button>}<button className="danger" onClick={() => void deleteSelection(menu.nodeIds, menu.edgeIds)}>{t('canvas.deleteSelection')}</button></> : <><button onClick={() => { void addCard(menu.position); setMenu(null) }}>{t('toolbar.newCard')}</button><button onClick={() => { void ipc.material.chooseFiles().then((paths: string[]) => onImportFiles(paths, menu.position)); setMenu(null) }}>{t('canvas.importHere')}</button><button onClick={() => { setPickerPosition(menu.position); setMenu(null) }}>{t('canvas.addFromWorkbench')}</button><button onClick={() => { void pasteCard(menu.position); setMenu(null) }}>{t('canvas.pasteAsCard')}</button></>}</div>}
     {pickerPosition && <div className="board-material-picker"><header><strong>{t('canvas.addFromWorkbench')}</strong><button onClick={() => setPickerPosition(null)}>{t('canvas.close')}</button></header><input autoFocus value={pickerQuery} onChange={(event) => setPickerQuery(event.target.value)} placeholder={t('canvas.searchMaterials')} /><div>{available.map((material) => <label key={material.id}><input type="checkbox" checked={pickedIds.includes(material.id)} onChange={() => setPickedIds((ids) => ids.includes(material.id) ? ids.filter((id) => id !== material.id) : [...ids, material.id])} /><span className={`picker-type ${material.type}`}>{material.type}</span>{material.title}</label>)}</div><button className="primary-button" disabled={!pickedIds.length} onClick={() => void addExisting()}>{t('canvas.addMaterials', { count: pickedIds.length })}</button></div>}
     {map.workstreams.length > 0 && <aside className="workstream-navigator" aria-label={t('canvas.workstreams')}>
-      <header><strong>{t('canvas.workstreams')}</strong><button onClick={() => setFocusedWorkstreamId(null)} disabled={!focusedWorkstreamId}>{t('canvas.showAll')}</button></header>
+      <header><strong>{t('canvas.workstreams')}</strong><button onClick={() => focusWorkstream(null)} disabled={!focusedWorkstreamId}>{t('canvas.showAll')}</button></header>
       {map.workstreams.map((workstream) => {
-        const collapsed = collapsedWorkstreams.includes(workstream.id)
+        const collapsed = workstream.collapsed
         const count = map.materials.filter((material) => material.workstreamId === workstream.id).length
         return <div key={workstream.id} className={focusedWorkstreamId === workstream.id ? 'active' : ''}>
-          <button onClick={() => setFocusedWorkstreamId((current) => current === workstream.id ? null : workstream.id)}>{workstream.name}<span>{count}</span></button>
-          <button aria-label={collapsed ? t('canvas.expand') : t('canvas.collapse')} title={collapsed ? t('canvas.expand') : t('canvas.collapse')} onClick={() => setCollapsedWorkstreams((current) => collapsed ? current.filter((id) => id !== workstream.id) : [...current, workstream.id])}>{collapsed ? '+' : '-'}</button>
+          <button style={{ borderLeft: `3px solid ${workstream.color}` }} onClick={() => focusWorkstream(workstream.id)}>{workstream.name}<span>{count}</span></button>
+          <button aria-label={collapsed ? t('canvas.expand') : t('canvas.collapse')} title={collapsed ? t('canvas.expand') : t('canvas.collapse')} onClick={() => toggleWorkstreamCollapse(workstream)}>{collapsed ? '+' : '-'}</button>
         </div>
       })}
     </aside>}
@@ -392,7 +451,7 @@ export function TopicCanvas({ map, materials, onRefresh, onImportFiles }: { map:
   </section>
 }
 
-function ProposalInspector({ proposals, map, onClose, onReview }: { proposals: TopicProposal[]; map: TopicMap; onClose(): void; onReview(proposalId: string, decision: 'accept' | 'archive'): void }): React.ReactElement {
+function ProposalInspector({ proposals, map, planSummary, diffCounts, onClose, onReview, onReviewAll, onIgnoreAll }: { proposals: TopicProposal[]; map: TopicMap; planSummary: string | null; diffCounts: { relations: number; cards: number; workstreams: number }; onClose(): void; onReview(proposalId: string, decision: 'accept' | 'archive'): void; onReviewAll(): void; onIgnoreAll(): void }): React.ReactElement {
   const { t } = useI18n()
   const proposalKindLabel: Record<string, string> = { create_relation: 'Create relation', rename_relation: 'Rename relation', set_sequence: 'Set sequence', set_card_style: 'Set card style', layout: 'Arrange layout', create_workstream: 'Create workstream' }
   if (t('canvas.apply') === '应用') Object.assign(proposalKindLabel, { create_relation: '创建关系', rename_relation: '重命名关系', set_sequence: '调整顺序', set_card_style: '修改卡片样式', layout: '调整布局', create_workstream: '创建分组' })
@@ -406,7 +465,7 @@ function ProposalInspector({ proposals, map, onClose, onReview }: { proposals: T
     if (proposal.kind === 'rename_relation') return `New name: ${String(proposal.payload.label ?? '')}`
     return proposalKindLabel[proposal.kind] ?? proposal.kind
   }
-  return <aside className="whiteboard-inspector proposal-inspector"><header><h3>{t('toolbar.proposals')}</h3><button className="icon-button" title={t('canvas.close')} aria-label={t('canvas.close')} onClick={onClose}>×</button></header>{!proposals.length ? <p className="proposal-empty">{t('canvas.proposalEmpty')}</p> : <div className="proposal-list">{proposals.map((proposal) => <article key={proposal.id}><span>{proposalKindLabel[proposal.kind] ?? proposal.kind}</span><strong>{summary(proposal)}</strong><p>{proposal.reason}</p>{proposal.evidence && <small>{t('canvas.evidence', { evidence: proposal.evidence })}</small>}<div><button className="secondary-button" onClick={() => onReview(proposal.id, 'archive')}>{t('canvas.ignore')}</button><button className="primary-button" onClick={() => onReview(proposal.id, 'accept')}>{t('canvas.apply')}</button></div></article>)}</div>}</aside>
+  return <aside className="whiteboard-inspector proposal-inspector"><header><h3>{t('toolbar.proposals')}</h3><button className="icon-button" title={t('canvas.close')} aria-label={t('canvas.close')} onClick={onClose}>×</button></header>{planSummary && <p>{planSummary}</p>}{(diffCounts.relations || diffCounts.cards || diffCounts.workstreams) > 0 && <div className="proposal-diff-summary">{t('canvas.diffSummary', diffCounts)}</div>}{proposals.length > 0 && <div className="proposal-batch-actions"><button className="secondary-button" onClick={onIgnoreAll}>{t('canvas.ignoreAll')}</button><button className="primary-button" onClick={onReviewAll}>{t('canvas.applyAll')}</button></div>}{!proposals.length ? <p className="proposal-empty">{t('canvas.proposalEmpty')}</p> : <div className="proposal-list">{proposals.map((proposal) => <article key={proposal.id} className={proposal.stale ? 'stale' : ''}><span>{proposalKindLabel[proposal.kind] ?? proposal.kind}</span><strong>{summary(proposal)}</strong><p>{proposal.stale ? t('canvas.staleProposal') : proposal.reason}</p>{proposal.evidence && <small>{t('canvas.evidence', { evidence: proposal.evidence })}</small>}<div><button className="secondary-button" onClick={() => onReview(proposal.id, 'archive')}>{t('canvas.ignore')}</button><button className="primary-button" disabled={Boolean(proposal.stale)} onClick={() => onReview(proposal.id, 'accept')}>{t('canvas.apply')}</button></div></article>)}</div>}</aside>
 }
 
 function CardInspector({ material, onClose, onPatchCard, onDeleteCard }: { material: TopicMap['materials'][number]; onClose(): void; onPatchCard(materialId: string, patch: Record<string, unknown>): void; onDeleteCard(materialId: string): void }): React.ReactElement {

@@ -1,157 +1,111 @@
-/**
- * Material Map 性能基准（合成数据，不依赖外部服务）
- *
- * 运行方式：npm run benchmark
- *
- * 测量指标：
- *  - 导入时间：批量导入 N 份合成 Markdown 材料的总耗时与单份均值
- *  - 增量索引：在已有工作区中新增单份材料的索引耗时（P50/P95）
- *  - Explorer 关系查询：listMaterialRelations 的 P50/P95 延迟
- *
- * 质量门禁：20 / 50 份材料规模下，关系查询 P95 必须 < 1000ms。
- */
-import { mkdtempSync, rmSync } from 'node:fs'
+/** Reproducible v1.5 canvas benchmark for 100, 300, and 500 cards. */
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { randomUUID } from 'node:crypto'
 import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { performance } from 'node:perf_hooks'
 import { WorkspaceService } from '../src/main/workspace-service'
+import { projectCanvasDiff } from '../src/renderer/src/features/topics/canvas-diff'
+import { projectWorkstreamContainers } from '../src/renderer/src/features/topics/workstream-containers'
+import { layoutTopic } from '../src/renderer/src/lib/topic-layout'
 
-const SCALES = [20, 50, 200] as const
-const RELATION_QUERY_P95_GATE_MS = 1_000
-const INCREMENTAL_SAMPLES = 10
+const SCALES = [100, 300, 500] as const
+const WORKSTREAM_COLORS = ['#08776f', '#3568b8', '#a14569', '#b26a21', '#7654a6']
+type BenchmarkDatabase = { exec(sql: string): void; run(sql: string, params?: Array<string | number | null>): void }
+type ServiceInternals = { db: BenchmarkDatabase; persist(): void }
+type CanvasMap = ReturnType<WorkspaceService['topicMap']>
 
-function percentile(sorted: number[], p: number): number {
-  if (!sorted.length) return 0
-  const index = Math.min(sorted.length - 1, Math.ceil((p / 100) * sorted.length) - 1)
-  return sorted[index]
+function fitBounds(map: CanvasMap): { x: number; y: number; width: number; height: number } {
+  const rects = [
+    ...map.materials.map((material) => ({ x: material.canvasX ?? 0, y: material.canvasY ?? 0, width: material.cardWidth ?? 220, height: material.cardHeight ?? 116 })),
+    ...projectWorkstreamContainers(map).map((container) => ({ x: container.x, y: container.y, width: container.width, height: container.height }))
+  ]
+  const left = Math.min(...rects.map((rect) => rect.x)); const top = Math.min(...rects.map((rect) => rect.y))
+  const right = Math.max(...rects.map((rect) => rect.x + rect.width)); const bottom = Math.max(...rects.map((rect) => rect.y + rect.height))
+  return { x: left, y: top, width: right - left, height: bottom - top }
 }
 
-function stats(samples: number[]): { p50: number; p95: number; mean: number } {
-  const sorted = [...samples].sort((a, b) => a - b)
-  return {
-    p50: percentile(sorted, 50),
-    p95: percentile(sorted, 95),
-    mean: samples.reduce((sum, value) => sum + value, 0) / samples.length,
-  }
-}
-
-function syntheticDocument(index: number, total: number): { title: string; text: string } {
-  const links: string[] = []
-  // 链式引用 + 少量跨段引用，模拟真实材料之间的关联密度
-  if (index > 0) links.push(`See [previous](doc-${index - 1}.md).`)
-  if (index >= 10 && index % 7 === 0) links.push(`Related to [earlier](doc-${index - 10}.md).`)
-  const body = Array.from(
-    { length: 12 },
-    (_, paragraph) =>
-      `Paragraph ${paragraph} of document ${index} discusses local evidence token-${index}-${paragraph}, ` +
-      `shared-topic-${index % 5} and project milestone planning notes.`,
-  ).join('\n\n')
-  return { title: `doc-${index}.md`, text: `# Document ${index} of ${total}\n${links.join('\n')}\n${body}` }
+function seedCanvasData(service: WorkspaceService, scale: number): { topicId: string; materialIds: string[] } {
+  const database = (service as unknown as ServiceInternals).db
+  const topicId = `benchmark-topic-${scale}-${randomUUID()}`
+  const date = new Date().toISOString()
+  const materialIds = Array.from({ length: scale }, () => randomUUID())
+  const workstreamIds = Array.from({ length: 5 }, () => randomUUID())
+  database.exec('BEGIN')
+  database.run('INSERT INTO topics (id, name, description, created_at, archived_at, color, revision, view_mode, confirmed_only, focused_workstream_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', [topicId, `Benchmark ${scale}`, null, date, null, '#08776f', 1, 'map', 0, null])
+  workstreamIds.forEach((id, index) => database.run('INSERT INTO workstreams (id, topic_id, name, position, source, color, collapsed) VALUES (?, ?, ?, ?, ?, ?, ?)', [id, topicId, `Lane ${index + 1}`, index, 'manual', WORKSTREAM_COLORS[index], 0]))
+  materialIds.forEach((id, index) => {
+    const title = `Material ${index + 1}`
+    database.run('INSERT INTO materials (id, type, title, mime_type, source_path, stored_path, url, site_name, excerpt, extracted_text, imported_at, occurred_at, occurred_at_source, status, error, hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', [id, 'note', title, 'text/plain', null, null, null, null, title, `Synthetic canvas evidence ${index + 1}.`, date, date, 'import', 'complete', null, null])
+    database.run('INSERT INTO topic_materials (topic_id, material_id, workstream_id, canvas_x, canvas_y, position_source, sequence, sequence_source, added_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)', [topicId, id, workstreamIds[index % workstreamIds.length], 120 + (index % 10) * 280, 100 + Math.floor(index / 10) * 170, 'manual', index + 1, 'manual', date])
+    if (index > 0) database.run('INSERT INTO relations (id, source_material_id, target_material_id, label, relation_type, evidence_text, evidence_material_id, confidence, created_by, created_at, topic_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', [randomUUID(), materialIds[index - 1], id, 'next', 'next', 'Synthetic sequence.', materialIds[index - 1], 0.8, 'manual', date, topicId])
+  })
+  database.exec('COMMIT')
+  ;(service as unknown as ServiceInternals).persist()
+  return { topicId, materialIds }
 }
 
 interface ScaleResult {
   scale: number
-  importTotalMs: number
-  importMeanMs: number
-  incrementalP50Ms: number
-  incrementalP95Ms: number
-  relationP50Ms: number
-  relationP95Ms: number
-  relationCount: number
+  seedMs: number
+  topicLoadMs: number
+  fitViewMs: number
+  dragPersistMs: number
+  layoutMs: number
+  edgeCount: number
+  workstreamCount: number
+  proposalPreviewCount: number
 }
 
 async function benchmarkScale(scale: number): Promise<ScaleResult> {
   const root = mkdtempSync(join(tmpdir(), `material-map-bench-${scale}-`))
+  const service = new WorkspaceService()
   try {
-    const service = new WorkspaceService()
     await service.create(join(root, 'workspace'), `Bench ${scale}`)
+    const seedStart = performance.now()
+    const seeded = seedCanvasData(service, scale)
+    const seedMs = performance.now() - seedStart
 
-    // 1. 批量导入
-    const importStart = performance.now()
-    const importSamples: number[] = []
-    for (let index = 0; index < scale; index += 1) {
-      const doc = syntheticDocument(index, scale)
-      const started = performance.now()
-      await service.createDocument(doc.title, doc.text, 'md')
-      importSamples.push(performance.now() - started)
-    }
-    const importTotalMs = performance.now() - importStart
+    const loadStart = performance.now()
+    const map = service.topicMap(seeded.topicId)
+    const proposalPreview = projectCanvasDiff(map, [{ id: 'preview-relation', topicId: seeded.topicId, kind: 'create_relation', reason: 'Benchmark preview.', evidence: 'Synthetic sequence.', materialId: null, relationId: null, payload: { sourceMaterialId: seeded.materialIds[0], targetMaterialId: seeded.materialIds[1], label: 'preview', relationType: 'next' }, status: 'pending', createdAt: '', updatedAt: '' }, { id: 'preview-lane', topicId: seeded.topicId, kind: 'create_workstream', reason: 'Benchmark preview.', evidence: 'Synthetic lane.', materialId: null, relationId: null, payload: { name: 'Preview lane', materialIds: seeded.materialIds.slice(0, 12) }, status: 'pending', createdAt: '', updatedAt: '' }])
+    const topicLoadMs = performance.now() - loadStart
 
-    // 2. 单文件增量索引（向已有工作区追加新材料）
-    const incrementalSamples: number[] = []
-    for (let sample = 0; sample < INCREMENTAL_SAMPLES; sample += 1) {
-      const doc = syntheticDocument(scale + sample, scale + INCREMENTAL_SAMPLES)
-      const started = performance.now()
-      await service.createDocument(`incremental-${sample}.md`, doc.text, 'md')
-      incrementalSamples.push(performance.now() - started)
-    }
+    const fitStart = performance.now()
+    const bounds = fitBounds(map)
+    if (bounds.width <= 0 || bounds.height <= 0) throw new Error('Canvas bounds were invalid.')
+    const fitViewMs = performance.now() - fitStart
 
-    // 3. Explorer 关系查询（对每份材料查询关联，Explorer 面板的核心路径）
-    const materials = service.listMaterials()
-    const relationSamples: number[] = []
-    let relationCount = 0
-    for (const material of materials) {
-      const started = performance.now()
-      const relations = service.listMaterialRelations(material.id, 5)
-      relationSamples.push(performance.now() - started)
-      relationCount += relations.length
-    }
+    const dragStart = performance.now()
+    service.positionMaterial(seeded.topicId, seeded.materialIds[0], 420, 260)
+    const dragged = service.topicMap(seeded.topicId).materials.find((material) => material.id === seeded.materialIds[0])
+    if (dragged?.canvasX !== 420 || dragged.canvasY !== 260) throw new Error('Canvas drag did not persist.')
+    const dragPersistMs = performance.now() - dragStart
 
-    const importStats = stats(importSamples)
-    const incrementalStats = stats(incrementalSamples)
-    const relationStats = stats(relationSamples)
-    return {
-      scale,
-      importTotalMs,
-      importMeanMs: importStats.mean,
-      incrementalP50Ms: incrementalStats.p50,
-      incrementalP95Ms: incrementalStats.p95,
-      relationP50Ms: relationStats.p50,
-      relationP95Ms: relationStats.p95,
-      relationCount,
-    }
+    const layoutStart = performance.now()
+    const positions = layoutTopic(map.materials.map((material) => ({ id: material.id, position: { x: material.canvasX ?? 0, y: material.canvasY ?? 0 }, data: {} })) as never, map.relations.map((relation) => ({ id: relation.id, source: relation.sourceMaterialId, target: relation.targetMaterialId })) as never)
+    if (positions.length !== map.materials.length) throw new Error('Canvas layout did not return every card.')
+    const layoutMs = performance.now() - layoutStart
+    return { scale, seedMs, topicLoadMs, fitViewMs, dragPersistMs, layoutMs, edgeCount: map.relations.length, workstreamCount: map.workstreams.length, proposalPreviewCount: proposalPreview.counts.relations + proposalPreview.counts.cards + proposalPreview.counts.workstreams }
   } finally {
+    service.close()
     rmSync(root, { recursive: true, force: true })
   }
 }
 
-function ms(value: number): string {
-  return `${value.toFixed(1)}ms`
-}
-
 async function main(): Promise<void> {
-  console.log('Material Map benchmark (synthetic data, local only)\n')
-  const results: ScaleResult[] = []
-  for (const scale of SCALES) {
-    const result = await benchmarkScale(scale)
-    results.push(result)
-    console.log(
-      [
-        `scale=${String(result.scale).padStart(3)}`,
-        `import total=${ms(result.importTotalMs)} mean/file=${ms(result.importMeanMs)}`,
-        `incremental p50=${ms(result.incrementalP50Ms)} p95=${ms(result.incrementalP95Ms)}`,
-        `relations p50=${ms(result.relationP50Ms)} p95=${ms(result.relationP95Ms)} (${result.relationCount} hits)`,
-      ].join(' | '),
-    )
-  }
-
-  // 质量门禁：20 / 50 份材料的关系查询 P95 < 1s
-  const failures: string[] = []
-  for (const result of results) {
-    if (result.scale <= 50 && result.relationP95Ms >= RELATION_QUERY_P95_GATE_MS) {
-      failures.push(`scale=${result.scale} relation P95 ${ms(result.relationP95Ms)} >= ${RELATION_QUERY_P95_GATE_MS}ms`)
-    }
-  }
-  console.log('')
-  if (failures.length) {
-    console.error(`GATE FAILED:\n${failures.map((failure) => `  - ${failure}`).join('\n')}`)
-    process.exitCode = 1
-  } else {
-    console.log(`GATE PASSED: relation query P95 < ${RELATION_QUERY_P95_GATE_MS}ms for 20/50-material workspaces`)
-  }
+  const scales: ScaleResult[] = []
+  for (const scale of SCALES) scales.push(await benchmarkScale(scale))
+  const failures = scales.flatMap((result) => [
+    result.edgeCount !== result.scale - 1 ? `scale=${result.scale}: expected ${result.scale - 1} relations` : '',
+    result.workstreamCount !== 5 ? `scale=${result.scale}: expected 5 workstreams` : '',
+    result.proposalPreviewCount !== 2 ? `scale=${result.scale}: proposal projection failed` : ''
+  ]).filter(Boolean)
+  const report = { version: '1.5.0', generatedAt: new Date().toISOString(), scales, gate: { passed: failures.length === 0, failures } }
+  const reportPath = process.env.MATERIAL_MAP_BENCHMARK_REPORT ?? join(tmpdir(), 'material-map-benchmark-v15.json')
+  mkdirSync(dirname(reportPath), { recursive: true }); writeFileSync(reportPath, `${JSON.stringify(report, null, 2)}\n`)
+  console.log(JSON.stringify({ ...report, reportPath }, null, 2))
+  if (failures.length) process.exitCode = 1
 }
 
-main().catch((error) => {
-  console.error(error)
-  process.exitCode = 1
-})
+main().catch((error) => { console.error(error); process.exitCode = 1 })

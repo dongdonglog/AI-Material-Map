@@ -5,6 +5,7 @@ release*/
 tmp/
 .superpowers/
 docs/
+test-results/
 *.db
 *.material-workspace
 workspace.sqlite

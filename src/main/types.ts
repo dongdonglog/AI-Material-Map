@@ -125,8 +125,8 @@ export type TopicProposalRunStatus = 'pending' | 'complete' | 'partial' | 'faile
 export interface TopicProposalRun { id: string; topicId: string; baseRevision: number; instruction: string; provider: string; model: string; summary: string; status: TopicProposalRunStatus; createdAt: string; updatedAt: string }
 export interface TopicProposal { id: string; topicId: string; kind: string; reason: string; evidence: string; materialId: string | null; relationId: string | null; payload: Record<string, unknown>; status: ProposalStatus; createdAt: string; updatedAt: string; runId?: string | null; baseRevision?: number | null; source?: TopicProposalSource; stale?: boolean }
 
-export interface Topic { id: string; name: string; description: string | null; createdAt: string; archivedAt: string | null; color: string; revision: number; viewMode: TopicViewMode; confirmedOnly: boolean }
-export interface Workstream { id: string; topicId: string; name: string; position: number; source: 'ai' | 'manual' }
+export interface Topic { id: string; name: string; description: string | null; createdAt: string; archivedAt: string | null; color: string; revision: number; viewMode: TopicViewMode; confirmedOnly: boolean; focusedWorkstreamId: string | null }
+export interface Workstream { id: string; topicId: string; name: string; position: number; source: 'ai' | 'manual'; color: string; collapsed: boolean }
 export type RelationWaypoint = { x: number; y: number }
 export type LineDash = 'auto' | 'solid' | 'dashed' | 'dotted'
 export interface Relation {

@@ -1,5 +1,5 @@
 import { expect, test } from 'playwright/test'
-import { closeApp, electronAvailable, launchApp, seedWorkspace, type LaunchedApp, type MaterialMapApi } from './helpers'
+import { closeApp, electronAvailable, launchApp, openWorkspaceWindow, seedWorkspace, type LaunchedApp, type MaterialMapApi } from './helpers'
 
 /**
  * Explorer 三栏界面：列表 → 阅读器 → 关系栏
@@ -17,12 +17,11 @@ test.describe('Explorer 三栏与关系管理', () => {
     launched = await launchApp()
     const { window, workspaceRoot } = launched
     await seedWorkspace(window, workspaceRoot)
-    await window.reload()
-    await window.waitForLoadState('domcontentloaded')
+    await openWorkspaceWindow(window, workspaceRoot)
 
     // 进入 Explorer 视图（默认视图或通过侧边栏导航）
     const explorer = window.locator('.explorer-view')
-    if (!(await explorer.count())) await window.locator('.nav-item', { hasText: /Explorer|浏览|材料/ }).first().click()
+    if (!(await explorer.count())) await window.locator('.nav-item').nth(1).click()
 
     await expect(window.locator('.explorer-list')).toBeVisible()
     // 选中第一份材料，阅读器与关系栏应出现
@@ -35,8 +34,7 @@ test.describe('Explorer 三栏与关系管理', () => {
     launched = await launchApp()
     const { window, workspaceRoot } = launched
     await seedWorkspace(window, workspaceRoot)
-    await window.reload()
-    await window.waitForLoadState('domcontentloaded')
+    await openWorkspaceWindow(window, workspaceRoot)
 
     const relationCount = await window.evaluate(async () => {
       const api = (window as unknown as { materialMap: MaterialMapApi }).materialMap
@@ -46,12 +44,12 @@ test.describe('Explorer 三栏与关系管理', () => {
     test.skip(relationCount === 0, '合成材料未产生系统关系，跳过证据展开断言')
 
     const explorer = window.locator('.explorer-view')
-    if (!(await explorer.count())) await window.locator('.nav-item', { hasText: /Explorer|浏览|材料/ }).first().click()
+    if (!(await explorer.count())) await window.locator('.nav-item').nth(1).click()
     await window.locator('.explorer-list .explorer-document, .explorer-list li, .explorer-list button').first().click()
 
     const relation = window.locator('.explorer-relations .explorer-relation, .relation-list > *').first()
     await expect(relation).toBeVisible()
-    await relation.click()
+    await relation.locator('.relation-actions button').first().click()
     await expect(window.locator('.relation-evidence, .evidence-item').first()).toBeVisible()
   })
 

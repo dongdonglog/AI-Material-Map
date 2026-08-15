@@ -21,8 +21,8 @@ export interface CanvasAction { id:string; kind:CanvasActionKind; reason:string;
 export interface CanvasAiPlan { runId:string; topicId:string; baseRevision:number; summary:string; actions:CanvasAction[]; warnings:string[]; model:{provider:string;model:string} }
 export interface TopicProposalRun { id:string; topicId:string; baseRevision:number; instruction:string; provider:string; model:string; summary:string; status:'pending'|'complete'|'partial'|'failed'|'applied'; createdAt:string; updatedAt:string }
 export interface TopicProposal { id:string; topicId:string; kind:string; reason:string; evidence:string; materialId?:string|null; relationId?:string|null; payload:Record<string, unknown>; status:'pending'|'accepted'|'archived'; createdAt:string; updatedAt:string; runId?:string|null; baseRevision?:number|null; source?:'legacy'|'canvas-ai'|'chat'; stale?:boolean }
-export interface Topic { id:string; name:string; description?:string|null; createdAt:string; archivedAt?:string|null; color?:string; revision:number; viewMode:TopicViewMode; confirmedOnly:boolean }
-export interface Workstream { id:string; topicId:string; name:string; position:number; source:string }
+export interface Topic { id:string; name:string; description?:string|null; createdAt:string; archivedAt?:string|null; color?:string; revision:number; viewMode:TopicViewMode; confirmedOnly:boolean; focusedWorkstreamId?:string|null }
+export interface Workstream { id:string; topicId:string; name:string; position:number; source:string; color:string; collapsed:boolean }
 export type ArrowStyle = 'none' | 'triangle' | 'open-triangle' | 'diamond'
 export type RelationWaypoint = { x:number; y:number }
 export type LineDash = 'auto'|'solid'|'dashed'|'dotted'

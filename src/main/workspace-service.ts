@@ -111,8 +111,9 @@ function asMaterial(row: SqlRow): Material {
 }
 const topicPalette = ['#08776f', '#3568b8', '#a14569', '#b26a21', '#7654a6', '#3c7d66']
 function topicColor(id: string): string { return topicPalette[[...id].reduce((sum, char) => sum + char.charCodeAt(0), 0) % topicPalette.length] }
-function asTopic(row: SqlRow): Topic { return { ...row, id: String(row.id), name: String(row.name), description: row.description as string | null, createdAt: String(row.created_at), archivedAt: row.archived_at as string | null, color: String(row.color ?? topicColor(String(row.id))), revision: Number(row.revision ?? 0), viewMode: row.view_mode === 'flow' ? 'flow' : 'map', confirmedOnly: Boolean(row.confirmed_only) } }
-function asWorkstream(row: SqlRow): Workstream { return { ...row, id: String(row.id), topicId: String(row.topic_id), name: String(row.name), position: Number(row.position), source: row.source as Workstream['source'] } }
+function workstreamColor(id: string): string { return topicPalette[([...id].reduce((sum, char) => sum + char.charCodeAt(0), 0) + 2) % topicPalette.length] }
+function asTopic(row: SqlRow): Topic { return { ...row, id: String(row.id), name: String(row.name), description: row.description as string | null, createdAt: String(row.created_at), archivedAt: row.archived_at as string | null, color: String(row.color ?? topicColor(String(row.id))), revision: Number(row.revision ?? 0), viewMode: row.view_mode === 'flow' ? 'flow' : 'map', confirmedOnly: Boolean(row.confirmed_only), focusedWorkstreamId: row.focused_workstream_id as string | null ?? null } }
+function asWorkstream(row: SqlRow): Workstream { return { ...row, id: String(row.id), topicId: String(row.topic_id), name: String(row.name), position: Number(row.position), source: row.source as Workstream['source'], color: String(row.color ?? workstreamColor(String(row.id))), collapsed: Boolean(row.collapsed) } }
 function parseRoutePoints(value: unknown): RelationWaypoint[] {
   try {
     const parsed = JSON.parse(String(value ?? '[]'))
@@ -247,9 +248,9 @@ export class WorkspaceService {
     this.requireDb().exec(`
       CREATE TABLE IF NOT EXISTS materials (id TEXT PRIMARY KEY, type TEXT NOT NULL, title TEXT NOT NULL, mime_type TEXT, source_path TEXT, stored_path TEXT, url TEXT, site_name TEXT, excerpt TEXT, extracted_text TEXT, imported_at TEXT NOT NULL, occurred_at TEXT, occurred_at_source TEXT NOT NULL, status TEXT NOT NULL, error TEXT, hash TEXT);
       CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL);
-      CREATE TABLE IF NOT EXISTS topics (id TEXT PRIMARY KEY, name TEXT NOT NULL, description TEXT, created_at TEXT NOT NULL, archived_at TEXT, color TEXT, revision INTEGER NOT NULL DEFAULT 0, view_mode TEXT NOT NULL DEFAULT 'map', confirmed_only INTEGER NOT NULL DEFAULT 0);
+      CREATE TABLE IF NOT EXISTS topics (id TEXT PRIMARY KEY, name TEXT NOT NULL, description TEXT, created_at TEXT NOT NULL, archived_at TEXT, color TEXT, revision INTEGER NOT NULL DEFAULT 0, view_mode TEXT NOT NULL DEFAULT 'map', confirmed_only INTEGER NOT NULL DEFAULT 0, focused_workstream_id TEXT);
       CREATE TABLE IF NOT EXISTS topic_materials (topic_id TEXT NOT NULL, material_id TEXT NOT NULL, workstream_id TEXT, canvas_x REAL, canvas_y REAL, position_source TEXT NOT NULL DEFAULT 'auto', card_color TEXT, card_tags TEXT, card_note TEXT, sequence INTEGER, sequence_source TEXT NOT NULL DEFAULT 'time', added_at TEXT, display_title TEXT, display_excerpt TEXT, card_width REAL, card_height REAL, card_text_color TEXT, card_font_size REAL, card_collapsed INTEGER NOT NULL DEFAULT 0, card_z_index INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(topic_id, material_id));
-      CREATE TABLE IF NOT EXISTS workstreams (id TEXT PRIMARY KEY, topic_id TEXT NOT NULL, name TEXT NOT NULL, position INTEGER NOT NULL, source TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS workstreams (id TEXT PRIMARY KEY, topic_id TEXT NOT NULL, name TEXT NOT NULL, position INTEGER NOT NULL, source TEXT NOT NULL, color TEXT, collapsed INTEGER NOT NULL DEFAULT 0);
       CREATE TABLE IF NOT EXISTS relations (id TEXT PRIMARY KEY, source_material_id TEXT NOT NULL, target_material_id TEXT NOT NULL, label TEXT NOT NULL, relation_type TEXT NOT NULL, evidence_text TEXT, evidence_material_id TEXT, confidence REAL, created_by TEXT NOT NULL, created_at TEXT NOT NULL, topic_id TEXT);
       CREATE TABLE IF NOT EXISTS topic_relation_styles (topic_id TEXT NOT NULL, relation_id TEXT NOT NULL, line_color TEXT, source_arrow INTEGER NOT NULL DEFAULT 0, source_arrow_style TEXT NOT NULL DEFAULT 'none', target_arrow_style TEXT NOT NULL DEFAULT 'triangle', animated INTEGER NOT NULL DEFAULT 1, archived INTEGER NOT NULL DEFAULT 0, branch_index INTEGER NOT NULL DEFAULT 0, line_kind TEXT NOT NULL DEFAULT 'auto', source_handle TEXT, target_handle TEXT, line_width REAL NOT NULL DEFAULT 2.75, line_dash TEXT NOT NULL DEFAULT 'auto', route_points TEXT NOT NULL DEFAULT '[]', label_anchor REAL NOT NULL DEFAULT .5, PRIMARY KEY(topic_id, relation_id));
       CREATE TABLE IF NOT EXISTS topic_editor_history (topic_id TEXT NOT NULL, sequence INTEGER NOT NULL, command_json TEXT NOT NULL, inverse_json TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY(topic_id, sequence));
@@ -276,6 +277,7 @@ export class WorkspaceService {
     `)
     this.requireDb().run("INSERT OR IGNORE INTO schema_migrations (version, name, applied_at) VALUES (1, 'baseline', ?)", [now()])
     this.requireDb().run("INSERT OR IGNORE INTO schema_migrations (version, name, applied_at) VALUES (2, 'canvas-ai-proposals-and-view-preferences', ?)", [now()])
+    this.requireDb().run("INSERT OR IGNORE INTO schema_migrations (version, name, applied_at) VALUES (3, 'workstream-presentation-and-focus', ?)", [now()])
     try { this.requireDb().run('CREATE VIRTUAL TABLE IF NOT EXISTS material_chunks_fts USING fts5(chunk_id UNINDEXED, material_id UNINDEXED, title, text, heading)'); this.ftsEnabled = true } catch { this.ftsEnabled = false }
     const topicTableColumns = this.query('PRAGMA table_info(topics)').map((row) => String(row.name))
     if (!topicTableColumns.includes('archived_at')) this.requireDb().run('ALTER TABLE topics ADD COLUMN archived_at TEXT')
@@ -283,6 +285,7 @@ export class WorkspaceService {
     if (!topicTableColumns.includes('revision')) this.requireDb().run('ALTER TABLE topics ADD COLUMN revision INTEGER NOT NULL DEFAULT 0')
     if (!topicTableColumns.includes('view_mode')) this.requireDb().run("ALTER TABLE topics ADD COLUMN view_mode TEXT NOT NULL DEFAULT 'map'")
     if (!topicTableColumns.includes('confirmed_only')) this.requireDb().run('ALTER TABLE topics ADD COLUMN confirmed_only INTEGER NOT NULL DEFAULT 0')
+    if (!topicTableColumns.includes('focused_workstream_id')) this.requireDb().run('ALTER TABLE topics ADD COLUMN focused_workstream_id TEXT')
     for (const topic of this.query("SELECT id FROM topics WHERE color IS NULL OR color=''")) this.requireDb().run('UPDATE topics SET color=? WHERE id=?', [topicColor(String(topic.id)), String(topic.id)])
     const topicColumns = this.query('PRAGMA table_info(topic_materials)').map((row) => String(row.name))
     if (!topicColumns.includes('canvas_x')) this.requireDb().run('ALTER TABLE topic_materials ADD COLUMN canvas_x REAL')
@@ -307,6 +310,10 @@ export class WorkspaceService {
     if (!proposalColumns.includes('run_id')) this.requireDb().run('ALTER TABLE topic_proposals ADD COLUMN run_id TEXT')
     if (!proposalColumns.includes('base_revision')) this.requireDb().run('ALTER TABLE topic_proposals ADD COLUMN base_revision INTEGER')
     if (!proposalColumns.includes('source')) this.requireDb().run("ALTER TABLE topic_proposals ADD COLUMN source TEXT NOT NULL DEFAULT 'legacy'")
+    const workstreamColumns = this.query('PRAGMA table_info(workstreams)').map((row) => String(row.name))
+    if (!workstreamColumns.includes('color')) this.requireDb().run('ALTER TABLE workstreams ADD COLUMN color TEXT')
+    if (!workstreamColumns.includes('collapsed')) this.requireDb().run('ALTER TABLE workstreams ADD COLUMN collapsed INTEGER NOT NULL DEFAULT 0')
+    for (const stream of this.query("SELECT id FROM workstreams WHERE color IS NULL OR color=''")) this.requireDb().run('UPDATE workstreams SET color=? WHERE id=?', [workstreamColor(String(stream.id)), String(stream.id)])
     const relationStyleColumns = this.query('PRAGMA table_info(topic_relation_styles)').map((row) => String(row.name))
     const relationColumns = this.query('PRAGMA table_info(relations)').map((row) => String(row.name))
     if (!relationColumns.includes('topic_id')) this.requireDb().run('ALTER TABLE relations ADD COLUMN topic_id TEXT')
@@ -511,7 +518,7 @@ export class WorkspaceService {
   }
   retry(materialId: string): void { void this.enqueueProcessing(materialId) }
   updateMaterialDate(id: string, occurredAt: string): void { this.run('UPDATE materials SET occurred_at=?, occurred_at_source=? WHERE id=?', [occurredAt, 'manual', id]) }
-  createTopic(name: string, description = ''): Topic { const topicId = id(); const topic = { id: topicId, name, description: description || null, createdAt: now(), archivedAt: null, color: topicColor(topicId), revision: 0, viewMode: 'map' as const, confirmedOnly: false }; this.run('INSERT INTO topics (id, name, description, created_at, archived_at, color, revision, view_mode, confirmed_only) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)', [topic.id, topic.name, topic.description, topic.createdAt, null, topic.color, topic.revision, topic.viewMode, 0]); return topic }
+  createTopic(name: string, description = ''): Topic { const topicId = id(); const topic = { id: topicId, name, description: description || null, createdAt: now(), archivedAt: null, color: topicColor(topicId), revision: 0, viewMode: 'map' as const, confirmedOnly: false, focusedWorkstreamId: null }; this.run('INSERT INTO topics (id, name, description, created_at, archived_at, color, revision, view_mode, confirmed_only, focused_workstream_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', [topic.id, topic.name, topic.description, topic.createdAt, null, topic.color, topic.revision, topic.viewMode, 0, null]); return topic }
   listTopics(): Topic[] { return this.query('SELECT * FROM topics WHERE archived_at IS NULL ORDER BY created_at DESC').map(asTopic) }
   listArchivedTopics(): Topic[] { return this.query('SELECT * FROM topics WHERE archived_at IS NOT NULL ORDER BY archived_at DESC').map(asTopic) }
   archiveTopic(topicId: string): void { this.run('UPDATE topics SET archived_at=? WHERE id=? AND archived_at IS NULL', [now(), topicId]); this.persist() }
@@ -570,23 +577,34 @@ export class WorkspaceService {
   updateCardOrder(topicId: string, materialId: string, sequence: number): void { if (!Number.isInteger(sequence) || sequence < 1) throw new Error('Sequence must be a positive integer.'); this.run("UPDATE topic_materials SET sequence=?, sequence_source='manual' WHERE topic_id=? AND material_id=?", [sequence, topicId, materialId]); this.rebuildSystemTopology(topicId) }
   resetCardOrder(topicId: string): void { this.run("UPDATE topic_materials SET sequence=NULL, sequence_source='time' WHERE topic_id=?", [topicId]); this.rebuildSystemTopology(topicId) }
   removeFromTopic(topicId: string, materialId: string): void { this.run('DELETE FROM topic_materials WHERE topic_id=? AND material_id=?', [topicId, materialId]); this.rebuildSystemTopology(topicId) }
-  updateTopicViewPreferences(topicId: string, input: { viewMode?: TopicViewMode; confirmedOnly?: boolean }): Topic {
+  updateTopicViewPreferences(topicId: string, input: { viewMode?: TopicViewMode; confirmedOnly?: boolean; focusedWorkstreamId?: string | null }): Topic {
     const current = first<SqlRow>(this.query('SELECT * FROM topics WHERE id=?', [topicId])); if (!current) throw new Error('Topic not found.')
     const viewMode = input.viewMode === undefined ? (current.view_mode === 'flow' ? 'flow' : 'map') : input.viewMode
     if (viewMode !== 'map' && viewMode !== 'flow') throw new Error('Unsupported topic view mode.')
     const confirmedOnly = input.confirmedOnly === undefined ? Boolean(current.confirmed_only) : Boolean(input.confirmedOnly)
-    this.run('UPDATE topics SET view_mode=?, confirmed_only=? WHERE id=?', [viewMode, confirmedOnly ? 1 : 0, topicId])
+    const focusedWorkstreamId = input.focusedWorkstreamId === undefined ? current.focused_workstream_id as string | null : input.focusedWorkstreamId
+    if (focusedWorkstreamId !== null && !this.query('SELECT id FROM workstreams WHERE id=? AND topic_id=?', [focusedWorkstreamId, topicId])[0]) throw new Error('Focused workstream is not part of this topic.')
+    this.run('UPDATE topics SET view_mode=?, confirmed_only=?, focused_workstream_id=? WHERE id=?', [viewMode, confirmedOnly ? 1 : 0, focusedWorkstreamId, topicId])
     return asTopic(first<SqlRow>(this.query('SELECT * FROM topics WHERE id=?', [topicId]))!)
   }
   topicRevision(topicId: string): number {
     const row = this.query('SELECT revision FROM topics WHERE id=?', [topicId])[0]; if (!row) throw new Error('Topic not found.')
     return Number(row.revision ?? 0)
   }
-  createWorkstream(topicId: string, name: string, source: 'ai' | 'manual' = 'manual'): Workstream { const position = this.query('SELECT COUNT(*) AS count FROM workstreams WHERE topic_id=?', [topicId])[0]?.count as number ?? 0; const stream = { id: id(), topicId, name, position: Number(position), source }; this.run('INSERT INTO workstreams VALUES (?, ?, ?, ?, ?)', [stream.id, stream.topicId, stream.name, stream.position, stream.source]); this.persist(); return stream }
+  createWorkstream(topicId: string, name: string, source: 'ai' | 'manual' = 'manual'): Workstream { const position = this.query('SELECT COUNT(*) AS count FROM workstreams WHERE topic_id=?', [topicId])[0]?.count as number ?? 0; const streamId = id(); const stream: Workstream = { id: streamId, topicId, name, position: Number(position), source, color: workstreamColor(streamId), collapsed: false }; this.run('INSERT INTO workstreams (id, topic_id, name, position, source, color, collapsed) VALUES (?, ?, ?, ?, ?, ?, ?)', [stream.id, stream.topicId, stream.name, stream.position, stream.source, stream.color, 0]); return stream }
   updateWorkstream(id: string, name: string): void { this.run('UPDATE workstreams SET name=? WHERE id=?', [name, id]) }
+  updateWorkstreamPresentation(id: string, input: { color?: string; collapsed?: boolean }): Workstream {
+    const current = first<SqlRow>(this.query('SELECT * FROM workstreams WHERE id=?', [id])); if (!current) throw new Error('Workstream not found.')
+    const color = input.color === undefined ? String(current.color ?? workstreamColor(id)) : normalizeColor(input.color)
+    if (!color) throw new Error('Workstream color must be a six-digit hexadecimal value.')
+    const collapsed = input.collapsed === undefined ? Boolean(current.collapsed) : input.collapsed
+    this.run('UPDATE workstreams SET color=?, collapsed=? WHERE id=?', [color, collapsed ? 1 : 0, id])
+    return asWorkstream(first<SqlRow>(this.query('SELECT * FROM workstreams WHERE id=?', [id]))!)
+  }
   deleteWorkstream(id: string): void {
     // Relations belong to materials, so deleting a lane only clears its grouping.
     this.run('UPDATE topic_materials SET workstream_id=NULL WHERE workstream_id=?', [id])
+    this.requireDb().run('UPDATE topics SET focused_workstream_id=NULL WHERE focused_workstream_id=?', [id])
     this.run('DELETE FROM workstreams WHERE id=?', [id])
   }
   moveMaterial(topicId: string, materialId: string, workstreamId: string | null): void { this.run('UPDATE topic_materials SET workstream_id=? WHERE topic_id=? AND material_id=?', [workstreamId, topicId, materialId]); this.persist() }
@@ -767,9 +785,16 @@ export class WorkspaceService {
       const workstreamId = payload.workstreamId ? this.commandId(payload.workstreamId, 'Workstream id') : id()
       if (this.query('SELECT id FROM workstreams WHERE id=?', [workstreamId])[0]) throw new Error('Workstream already exists.')
       const position = Number(this.query('SELECT COUNT(*) AS count FROM workstreams WHERE topic_id=?', [topicId])[0]?.count ?? 0)
-      this.requireDb().run('INSERT INTO workstreams VALUES (?, ?, ?, ?, ?)', [workstreamId, topicId, name, position, 'ai'])
+      const color = payload.color === undefined
+        ? workstreamColor(workstreamId)
+        : typeof payload.color === 'string'
+          ? normalizeColor(payload.color)
+          : null
+      if (!color) throw new Error('Workstream color must be a six-digit hexadecimal value.')
+      const collapsed = payload.collapsed === true
+      this.requireDb().run('INSERT INTO workstreams (id, topic_id, name, position, source, color, collapsed) VALUES (?, ?, ?, ?, ?, ?, ?)', [workstreamId, topicId, name, position, 'ai', color, collapsed ? 1 : 0])
       for (const materialId of materialIds) this.requireDb().run('UPDATE topic_materials SET workstream_id=? WHERE topic_id=? AND material_id=?', [workstreamId, topicId, materialId])
-      return { forward: { kind: 'createWorkstream', payload: { workstreamId, name, materialIds } }, inverse: { kind: 'removeWorkstream', payload: { workstreamId, previousAssignments } } }
+      return { forward: { kind: 'createWorkstream', payload: { workstreamId, name, materialIds, color, collapsed } }, inverse: { kind: 'removeWorkstream', payload: { workstreamId, previousAssignments } } }
     }
     if (command.kind === 'removeWorkstream') {
       const workstreamId = this.commandId(payload.workstreamId, 'Workstream id'); const stream = this.query('SELECT * FROM workstreams WHERE id=? AND topic_id=?', [workstreamId, topicId])[0]
@@ -783,7 +808,7 @@ export class WorkspaceService {
       }
       this.requireDb().run('UPDATE topic_materials SET workstream_id=NULL WHERE topic_id=? AND workstream_id=?', [topicId, workstreamId])
       this.requireDb().run('DELETE FROM workstreams WHERE id=?', [workstreamId])
-      return { inverse: { kind: 'createWorkstream', payload: { workstreamId, name: String(stream.name), materialIds: currentMaterialIds } } }
+      return { inverse: { kind: 'createWorkstream', payload: { workstreamId, name: String(stream.name), materialIds: currentMaterialIds, color: String(stream.color ?? workstreamColor(workstreamId)), collapsed: Boolean(stream.collapsed) } } }
     }
     if (command.kind === 'reconnectRelation') {
       const relationId = this.commandId(payload.relationId, 'Relation id'); const row = this.query('SELECT * FROM relations WHERE id=?', [relationId])[0]
@@ -913,7 +938,14 @@ export class WorkspaceService {
     } catch (error) { this.requireDb().exec('ROLLBACK'); throw error }
   }
   private rebuildExistingSystemTopologies(): void {
-    for (const row of this.query('SELECT id FROM topics WHERE archived_at IS NULL')) this.rebuildSystemTopology(String(row.id))
+    for (const row of this.query('SELECT id FROM topics WHERE archived_at IS NULL')) {
+      const topicId = String(row.id)
+      const counts = this.query('SELECT COUNT(*) AS total, SUM(CASE WHEN canvas_x IS NOT NULL AND canvas_y IS NOT NULL THEN 1 ELSE 0 END) AS positioned FROM topic_materials WHERE topic_id=?', [topicId])[0]
+      // Existing v1.5 boards already have stable coordinates. Rebuilding them
+      // while opening a workspace would create a false revision conflict for
+      // every pending AI proposal. Only initialize genuinely legacy boards.
+      if (Number(counts?.total ?? 0) > 0 && Number(counts?.positioned ?? 0) === 0) this.rebuildSystemTopology(topicId)
+    }
   }
   createRelation(input: Omit<Relation, 'id' | 'createdAt'>): Relation {
     if (input.sourceMaterialId === input.targetMaterialId) throw new Error('A material cannot be related to itself.')
@@ -1085,7 +1117,8 @@ export class WorkspaceService {
   updateRelation(id: string, label: string): void { this.run('UPDATE relations SET label=? WHERE id=?', [label, id]) }
   deleteRelation(id: string): void { this.run('DELETE FROM relations WHERE id=?', [id]) }
   topicMap(topicId: string): TopicMap {
-    const topic = first<Topic>(this.query('SELECT * FROM topics WHERE id=?', [topicId])); if (!topic) throw new Error('Topic not found')
+    const topicRow = first<SqlRow>(this.query('SELECT * FROM topics WHERE id=?', [topicId])); if (!topicRow) throw new Error('Topic not found')
+    const topic = asTopic(topicRow)
     const materials = this.query('SELECT m.*, mis.availability AS availability, mis.last_indexed_at AS lastIndexedAt, tm.workstream_id AS workstreamId, tm.canvas_x AS canvasX, tm.canvas_y AS canvasY, tm.position_source AS positionSource, tm.card_color AS cardColor, tm.card_tags AS cardTags, tm.card_note AS cardNote, tm.sequence AS sequence, tm.sequence_source AS sequenceSource, tm.added_at AS addedAt, tm.display_title AS displayTitle, tm.display_excerpt AS displayExcerpt, tm.card_width AS cardWidth, tm.card_height AS cardHeight, tm.card_text_color AS cardTextColor, tm.card_font_size AS cardFontSize, tm.card_collapsed AS cardCollapsed, tm.card_z_index AS cardZIndex FROM materials m JOIN topic_materials tm ON tm.material_id=m.id LEFT JOIN material_index_state mis ON mis.material_id=m.id WHERE tm.topic_id=? ORDER BY m.occurred_at', [topicId]).map((row) => { let cardTags: string[] = []; try { const value = JSON.parse(String(row.cardTags ?? '[]')); if (Array.isArray(value)) cardTags = value.filter((tag): tag is string => typeof tag === 'string') } catch { /* Old or invalid rows use empty tags. */ } const material = asMaterial(row); return { ...material, workstreamId: row.workstreamId as string | null, canvasX: row.canvasX as number | null, canvasY: row.canvasY as number | null, positionSource: row.positionSource === 'manual' ? 'manual' as const : 'auto' as const, cardColor: row.cardColor as string | null, cardTags, tags: this.listMaterialTags(material.id), cardNote: row.cardNote as string | null, sequence: row.sequence as number | null, sequenceSource: String(row.sequenceSource ?? 'time'), addedAt: row.addedAt as string | null, displayTitle: row.displayTitle as string | null, displayExcerpt: row.displayExcerpt as string | null, cardWidth: row.cardWidth === null ? null : Number(row.cardWidth), cardHeight: row.cardHeight === null ? null : Number(row.cardHeight), cardTextColor: row.cardTextColor as string | null, cardFontSize: row.cardFontSize === null ? null : Number(row.cardFontSize), cardCollapsed: Boolean(row.cardCollapsed), cardZIndex: Number(row.cardZIndex ?? 0) } })
     const ids = materials.map((m) => m.id); const placeholders = ids.map(() => '?').join(',') || "''"
     const candidates = this.listTopicCandidates(topicId)
@@ -1448,6 +1481,21 @@ export class WorkspaceService {
     const archived = this.updateTopicProposalStatus(proposalId, 'archived')
     if (!archived) throw new Error('Proposal could not be archived.')
     return archived
+  }
+  archiveTopicProposals(topicId: string, proposalIds: string[]): TopicProposal[] {
+    const ids = [...new Set(proposalIds)]
+    if (!ids.length || ids.length > 64) throw new Error('Proposal list is invalid.')
+    return this.withTransaction(() => {
+      const proposals = ids.map((proposalId) => {
+        const proposal = this.listTopicProposals(topicId).find((item) => item.id === proposalId)
+        if (!proposal) throw new Error('Pending proposal not found.')
+        return proposal
+      })
+      const archived = proposals.map((proposal) => this.updateTopicProposalStatus(proposal.id, 'archived')).filter((proposal): proposal is TopicProposal => Boolean(proposal))
+      if (archived.length !== proposals.length) throw new Error('Some proposals could not be archived.')
+      for (const runId of [...new Set(proposals.map((proposal) => proposal.runId).filter((value): value is string => Boolean(value)))]) this.refreshProposalRunStatus(runId)
+      return archived
+    })
   }
 
   searchKnowledge(query: string, options: { limit?: number; sourceId?: string } = {}): SearchHit[] {

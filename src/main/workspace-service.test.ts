@@ -724,6 +724,19 @@ describe('WorkspaceService', () => {
     expect(service.topicMap(topic.id).relations).toHaveLength(0)
   })
 
+  it('keeps a current proposal reviewable after reopening an unchanged workspace', async () => {
+    const root = join(makeRoot(), 'workspace')
+    const service = makeService(); await service.create(root, 'Knowledge')
+    const first = await service.createNote('First', 'The first review step.'); const second = await service.createNote('Second', 'The second review step.')
+    const topic = service.createTopic('Review'); service.addMaterialsToTopic(topic.id, [first.id, second.id])
+    const baseRevision = service.topicMap(topic.id).topic.revision
+    const proposal = service.createTopicProposals(topic.id, [{ kind: 'create_relation', reason: 'The steps are consecutive.', evidence: 'First, then second.', materialId: null, relationId: null, payload: { sourceMaterialId: first.id, targetMaterialId: second.id, relationType: 'next', label: 'next' }, baseRevision, source: 'canvas-ai' }])[0]
+
+    const reopened = makeService(); await reopened.open(root)
+    expect(reopened.topicMap(topic.id).topic.revision).toBe(baseRevision)
+    expect(reopened.listTopicProposals(topic.id)).toEqual([expect.objectContaining({ id: proposal.id, stale: false })])
+  })
+
   it('persists map view preferences with legacy-safe defaults', async () => {
     const service = makeService(); await service.create(makeRoot(), 'Knowledge')
     const topic = service.createTopic('Review')
@@ -731,6 +744,37 @@ describe('WorkspaceService', () => {
     expect(topic.confirmedOnly).toBe(false)
     const updated = service.updateTopicViewPreferences(topic.id, { viewMode: 'flow', confirmedOnly: true })
     expect(updated).toMatchObject({ viewMode: 'flow', confirmedOnly: true })
+  })
+
+  it('persists workstream presentation and focus preferences after reopening', async () => {
+    const root = join(makeRoot(), 'workspace')
+    const service = makeService(); await service.create(root, 'Knowledge')
+    const note = await service.createNote('Research', 'Keep this workstream visible in the canvas.')
+    const topic = service.createTopic('Review')
+    const workstream = service.createWorkstream(topic.id, 'Research lane')
+    service.addToTopic(topic.id, note.id, workstream.id)
+    expect(service.updateWorkstreamPresentation(workstream.id, { color: '#3568B8', collapsed: true })).toMatchObject({ color: '#3568b8', collapsed: true })
+    service.updateTopicViewPreferences(topic.id, { focusedWorkstreamId: workstream.id })
+
+    const reopened = makeService(); await reopened.open(root)
+    expect(reopened.topicMap(topic.id)).toMatchObject({
+      topic: { focusedWorkstreamId: workstream.id },
+      workstreams: [expect.objectContaining({ id: workstream.id, color: '#3568b8', collapsed: true })]
+    })
+  })
+
+  it('archives proposal batches atomically', async () => {
+    const service = makeService(); await service.create(makeRoot(), 'Knowledge')
+    const topic = service.createTopic('Review')
+    const proposals = service.createTopicProposals(topic.id, [
+      { kind: 'layout', reason: 'Keep the flow readable.', evidence: 'The materials form a sequence.', materialId: null, relationId: null, payload: { positions: [] } },
+      { kind: 'create_workstream', reason: 'These items belong together.', evidence: 'They share the same task.', materialId: null, relationId: null, payload: { name: 'Draft', materialIds: [] } }
+    ])
+
+    expect(() => service.archiveTopicProposals(topic.id, [proposals[0].id, 'missing-proposal'])).toThrow('Pending proposal not found.')
+    expect(service.listTopicProposals(topic.id).map((proposal) => proposal.id)).toEqual(proposals.map((proposal) => proposal.id))
+    expect(service.archiveTopicProposals(topic.id, proposals.map((proposal) => proposal.id)).map((proposal) => proposal.status)).toEqual(['archived', 'archived'])
+    expect(service.listTopicProposals(topic.id)).toHaveLength(0)
   })
 
   it('requeues materials left running when a workspace is reopened', async () => {
