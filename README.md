@@ -6,7 +6,7 @@
 
 <p align="center">
   <strong>让本地材料自己长出脉络。</strong><br />
-  将文件、笔记和链接留在自己的工作区，导入后按主题和证据形成可编辑的材料地图。
+  将文件、笔记和链接留在自己的工作区，导入后按主题和证据形成可编辑的材料地图与可阅读的主题 Wiki。
 </p>
 
 <p align="center">
@@ -22,18 +22,18 @@
 
 ## 这是什么
 
-Material Map 是一个本地优先的桌面材料地图和小型知识库。它把材料导入、全文检索、可解释关联、主题画板和可选 AI 问答放在同一个工作区里。
+Material Map 是一个本地优先的桌面材料地图和小型知识库。它把材料导入、全文检索、可解释关联、主题画板、主题 Wiki 和可选 AI 问答放在同一个工作区里。
 
 它适合整理技术文档、项目资料、学习笔记和个人文件。原始文件仍由你管理；工作区保存索引、摘要、关系、主题布局和导出数据。AI 默认关闭，只有你主动配置并发送问题时才会接收本次请求所需的材料上下文。
 
 ## 下载
 
-当前稳定版本：[v1.0.0 Release](https://github.com/dongdonglog/Auto-connect-project/releases/tag/v1.0.0)
+最新发布版本：[前往 Releases](https://github.com/dongdonglog/Auto-connect-project/releases/latest)
 
 | 平台 | 产物 | 适用场景 |
 | --- | --- | --- |
-| Windows x64 | [安装版](https://github.com/dongdonglog/Auto-connect-project/releases/download/v1.0.0/Material.Map.Setup.1.0.0.exe) · [Portable](https://github.com/dongdonglog/Auto-connect-project/releases/download/v1.0.0/Material.Map.1.0.0.exe) | Intel / AMD Windows 10/11 |
-| macOS arm64 | [DMG](https://github.com/dongdonglog/Auto-connect-project/releases/download/v1.0.0/Material.Map-1.0.0-arm64.dmg) · [ZIP](https://github.com/dongdonglog/Auto-connect-project/releases/download/v1.0.0/Material.Map-1.0.0-arm64-mac.zip) | Apple Silicon（M 系列） |
+| Windows x64 | [下载最新安装包](https://github.com/dongdonglog/Auto-connect-project/releases/latest) | Intel / AMD Windows 10/11 |
+| macOS arm64 | [下载最新 DMG / ZIP](https://github.com/dongdonglog/Auto-connect-project/releases/latest) | Apple Silicon（M 系列） |
 
 macOS 首次打开若出现安全提示，请在“系统设置 → 隐私与安全性”中允许打开。当前安装包没有 Apple Developer ID 签名和公证。
 
@@ -42,9 +42,11 @@ macOS 首次打开若出现安全提示，请在“系统设置 → 隐私与安
 - **本地工作区**：创建、打开、加密、导出和恢复工作区，原始文件不被应用移动。
 - **材料管理**：导入 Markdown、TXT、CSV、JSON、HTML、PDF、DOCX，或直接创建笔记、文档和链接。
 - **关系探索**：从材料中发现显式引用、共享实体和结构邻近关系，每条关联都可以展开证据。
-- **主题画板**：将材料固定到主题中，创建单向正式关系，编辑卡片样式、路径、箭头和布局。
+- **主题画板**：将材料固定到主题中，以自由地图或流程视图组织正式关系；支持工作流分组、聚焦、筛选、布局和撤销。
+- **主题 Wiki**：将一个主题沉淀为带证据引用的阅读页，包含摘要、关键结论、材料关系和待解决问题。
 - **可选 AI**：接入 DeepSeek、OpenAI 兼容服务、Ollama、Anthropic 或 Gemini，回答材料问题并显示模型与来源。
-- **Agent / MCP**：AI 可以按问题查询材料、关系和主题；涉及画板修改时只生成待审核提案。
+- **可审核 AI**：AI 可以生成画板修改或 Wiki 更新草稿；所有提案都需要由你确认后才会生效。
+- **Agent / MCP**：AI 可以按问题查询材料、关系和主题，并通过本地 Material Map 工具生成可审核的操作提案。
 
 ## 完整操作流程
 
@@ -122,6 +124,8 @@ macOS 首次打开若出现安全提示，请在“系统设置 → 隐私与安
 - **自由画板**：自由摆放卡片和关系。
 - **流程视图**：按连接关系自动排列卡片。
 
+还可以为卡片设置工作流分组和颜色，折叠暂时不需要查看的分组；使用“聚焦所选”查看选中材料的一跳关系，或使用“仅显示已确认内容”排除仍在审核中的 AI 提案。
+
 常用操作：
 
 1. 拖动卡片调整位置。
@@ -132,7 +136,27 @@ macOS 首次打开若出现安全提示，请在“系统设置 → 隐私与安
 6. 点击卡片打开“画板卡片属性”，只修改当前主题的显示标题、摘要、颜色、标签、备注和布局样式。
 7. 使用“自动排版”按关系整理位置，使用“适配视图”缩放到全部卡片。
 
-### 7. 多选、删除、平移和撤销
+### 7. 审核 AI 画板提案
+
+在主题画板中点击 AI 操作，选择需要分析的材料后生成提案。提案会以差异覆盖层显示，不会直接修改画板。你可以逐项查看变化和依据，也可以一次性应用或忽略全部提案；已应用的操作可通过画板撤销恢复。
+
+### 8. 生成并审核主题 Wiki
+
+在主题画板工具栏中点击“主题 Wiki”，即可为当前主题生成总览。生成过程只使用当前主题中的材料和关系，并先保存为草稿：
+
+1. 阅读主题摘要、关键结论、材料关系、待解决问题和每项内容的证据。
+2. 点击证据可回到材料阅读器中的原始位置。
+3. 通过“查看差异”比较正式页面和更新草稿，确认后再应用，或直接忽略草稿。
+4. 在版本历史中查看已应用的版本，并可恢复为一个新的正式版本。
+5. 材料或关系变化后，Wiki 会标记为“需要更新”，但不会自动调用 AI。
+
+系统会显示需要检查的状态，例如引用材料或片段已不存在、页面基于过期主题版本生成，或结论缺少证据。
+
+<p align="center">
+  <img src="./assets/screenshots/09-topic-wiki.png" alt="Material Map 主题画板与主题 Wiki" width="960" />
+</p>
+
+### 9. 多选、删除、平移和撤销
 
 - 从画布空白处左键拖拽，可以框选卡片和连线。
 - 框选后，在选区范围内的空白处右键打开所选内容菜单。
@@ -143,7 +167,7 @@ macOS 首次打开若出现安全提示，请在“系统设置 → 隐私与安
 - `Cmd/Ctrl + Z` 撤销，`Cmd/Ctrl + Shift + Z` 重做。
 - `Space + 左键拖拽`、中键或触控板滚动用于平移画布。
 
-### 8. 配置 AI
+### 10. 配置 AI
 
 打开侧边栏“模型与隐私”，点击“配置 AI”创建配置：
 
@@ -159,7 +183,7 @@ macOS 首次打开若出现安全提示，请在“系统设置 → 隐私与安
   <img src="./assets/screenshots/07-ai-settings.png" alt="Material Map AI 配置和隐私设置" width="960" />
 </p>
 
-### 9. 使用知识库问答
+### 11. 使用知识库问答
 
 打开侧边栏“知识库问答”。AI 未配置或未启用时，输入框不会发送问题。
 
@@ -178,7 +202,7 @@ macOS 首次打开若出现安全提示，请在“系统设置 → 隐私与安
   <img src="./assets/screenshots/04-knowledge-chat.png" alt="Material Map 知识库问答" width="960" />
 </p>
 
-### 10. 持续同步文件夹
+### 12. 持续同步文件夹
 
 打开侧边栏“文件夹来源”：
 
@@ -194,7 +218,7 @@ macOS 首次打开若出现安全提示，请在“系统设置 → 隐私与安
   <img src="./assets/screenshots/06-folder-sources.png" alt="Material Map 文件夹来源" width="960" />
 </p>
 
-### 11. 导出和恢复工作区
+### 13. 导出和恢复工作区
 
 1. 在侧边栏点击“导出工作区”。
 2. 选择保存位置，保存为 `.material-workspace` 文件。
@@ -211,7 +235,8 @@ macOS 首次打开若出现安全提示，请在“系统设置 → 隐私与安
 - 工作区数据库、索引、摘要和关系默认保存在本地。
 - 原始导入文件不会被应用移动或删除。
 - AI 默认关闭；云端 AI 只有在用户配置、授权并主动提问后才会收到必要文本。
-- AI 对画板的修改先生成待审核提案，不会静默修改正式关系。
+- AI 对画板和主题 Wiki 的修改先生成待审核提案，不会静默修改正式内容。
+- 主题 Wiki 使用应用自己的结构化数据保存，不会改写原始 Markdown 或其他导入文件，也不依赖 Obsidian。
 - 请不要把 API Key、工作区数据库、导出包或个人材料提交到 Git 仓库。
 
 ## 从源码运行
