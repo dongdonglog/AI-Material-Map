@@ -45,6 +45,31 @@ async function startCanvasModel(): Promise<string> {
   return `http://127.0.0.1:${address.port}`
 }
 
+async function startWikiModel(): Promise<string> {
+  modelServer = createServer((request, response) => {
+    response.setHeader('content-type', 'application/json')
+    if (request.url === '/api/tags') { response.end(JSON.stringify({ models: [{ name: 'wiki-e2e-model' }] })); return }
+    let body = ''
+    request.on('data', (chunk) => { body += String(chunk) })
+    request.on('end', () => {
+      const prompt = String((JSON.parse(body) as { prompt?: string }).prompt ?? '')
+      if (prompt.includes('planning a topic Wiki')) {
+        const packet = JSON.parse(prompt.slice(prompt.indexOf('Topic packet: ') + 'Topic packet: '.length)) as { materials: Array<{ id: string; evidence: Array<{ chunkId: string }> }> }
+        const material = packet.materials[0]; const chunkId = material?.evidence[0]?.chunkId
+        response.end(JSON.stringify({ response: JSON.stringify({ summaryFocus: 'A cited local overview.', keyPoints: [{ focus: 'The first material establishes the topic.', evidenceChunkIds: [chunkId] }], relations: [], openQuestions: [] }) }))
+        return
+      }
+      const evidence = JSON.parse(prompt.slice(prompt.indexOf('Evidence: ') + 'Evidence: '.length)) as Array<{ materialId: string; chunkId: string }>
+      const first = evidence[0]
+      const content = prompt.includes('Return {"summary"') ? { summary: 'A cited local overview.' } : prompt.includes('for key conclusions') ? { items: [{ text: 'The first material establishes the topic.', evidenceChunkIds: [first?.chunkId] }] } : { items: [] }
+      response.end(JSON.stringify({ response: JSON.stringify(content) }))
+    })
+  })
+  await new Promise<void>((resolve) => modelServer?.listen(0, '127.0.0.1', resolve))
+  const address = modelServer.address() as AddressInfo
+  return `http://127.0.0.1:${address.port}`
+}
+
 test.describe('v1.5 canvas proposal review', () => {
   test('shows the AI diff before atomically applying all pending proposals', async () => {
     const modelBaseUrl = await startCanvasModel()
@@ -84,5 +109,69 @@ test.describe('v1.5 canvas proposal review', () => {
       const map = await api.topics.map(topicId)
       return { pending: (await api.topics.proposals(topicId)).length, proposedRelations: map.relations.filter((relation: { label: string }) => relation.label === 'next').length, workstreams: map.workstreams.map((workstream: { name: string; source: string }) => ({ name: workstream.name, source: workstream.source })), undo: map.history.undo }
     }, setup.topicId)).toEqual({ pending: 0, proposedRelations: 1, workstreams: [{ name: 'Review lane', source: 'ai' }], undo: true })
+  })
+
+  test('opens the topic Wiki reader without changing the canvas', async () => {
+    launched = await launchApp()
+    const { window, workspaceRoot } = launched
+    await seedWorkspace(window, workspaceRoot)
+    const topicName = `Wiki topic ${Date.now()}`
+    await window.evaluate(async (name) => {
+      const api = (window as unknown as { materialMap: any }).materialMap
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        const jobs = await api.jobs()
+        if (jobs.every((job: { status: string }) => job.status === 'complete' || job.status === 'failed')) break
+        await new Promise((resolve) => window.setTimeout(resolve, 50))
+      }
+      const materials = await api.materials.list()
+      const topic = await api.topics.create(name)
+      await api.topics.addMaterials(topic.id, materials.map((material: { id: string }) => material.id))
+    }, topicName)
+    await window.reload()
+    await window.locator('button', { hasText: workspaceRoot }).click()
+    await window.locator('.app-shell').waitFor()
+    await window.locator('.topic-item', { hasText: topicName }).click()
+    await expect(window.locator('.whiteboard-stage')).toBeVisible()
+    await window.locator('button.wiki-tool').click()
+    await expect(window.locator('.topic-wiki-panel')).toBeVisible()
+    await expect(window.getByText('还没有主题 Wiki')).toBeVisible()
+    await expect(window.locator('.whiteboard-stage')).toBeVisible()
+  })
+
+  test('reviews a generated Wiki, records its version, and locates cited source text', async () => {
+    const modelBaseUrl = await startWikiModel()
+    launched = await launchApp()
+    const { window, workspaceRoot } = launched
+    await seedWorkspace(window, workspaceRoot)
+    const topicName = `Wiki evidence ${Date.now()}`
+    await window.evaluate(async ({ name, baseUrl }) => {
+      const api = (window as unknown as { materialMap: any }).materialMap
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        const jobs = await api.jobs()
+        if (jobs.every((job: { status: string }) => job.status === 'complete' || job.status === 'failed')) break
+        await new Promise((resolve) => window.setTimeout(resolve, 50))
+      }
+      const materials = await api.materials.list()
+      const topic = await api.topics.create(name)
+      await api.topics.addMaterials(topic.id, materials.map((material: { id: string }) => material.id))
+      const profile = await api.profiles.save({ name: `Wiki test model ${Date.now()}`, provider: 'ollama', wireApi: 'chat_completions', baseUrl })
+      await api.settings.save({ profileId: profile.id, provider: profile.provider, baseUrl: profile.baseUrl, chatModel: profile.recommendedModel ?? 'wiki-e2e-model', embeddingModel: '', allowCloud: false, enabled: true })
+    }, { name: topicName, baseUrl: modelBaseUrl })
+    await window.reload()
+    await window.locator('button', { hasText: workspaceRoot }).click()
+    await window.locator('.topic-item', { hasText: topicName }).click()
+    await window.locator('button.wiki-tool').click()
+    await window.getByRole('button', { name: '生成 Wiki' }).click()
+    await expect(window.locator('.topic-wiki-draft-banner')).toBeVisible()
+    await expect(window.locator('.topic-wiki-evidence button').first()).toBeVisible()
+    await window.getByRole('button', { name: '应用草稿' }).click()
+    await expect(window.getByText('Wiki 草稿已应用。')).toBeVisible()
+    await window.getByRole('button', { name: '版本历史' }).click()
+    await expect(window.locator('.topic-wiki-history')).toBeVisible()
+    await expect(window.getByText('版本 1')).toBeVisible()
+    await window.locator('.topic-wiki-history header .icon-button').click()
+    await window.locator('.topic-wiki-evidence button').first().click()
+    await expect(window.locator('.evidence-locator')).toBeVisible()
+    await expect(window.locator('[data-evidence-highlight]')).toBeVisible()
   })
 })

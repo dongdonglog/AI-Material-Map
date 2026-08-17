@@ -10,11 +10,12 @@ export interface ExplorerProps {
   materials: Material[]
   topics: Topic[]
   initialMaterialId?: string | null
+  initialEvidenceFocus?: EvidenceFocus | null
   onSelect(material: Material): void
   onChanged(): Promise<void>
 }
 
-export function Explorer({ materials, topics, initialMaterialId, onSelect, onChanged }: ExplorerProps): React.ReactElement {
+export function Explorer({ materials, topics, initialMaterialId, initialEvidenceFocus, onSelect, onChanged }: ExplorerProps): React.ReactElement {
   const { t, locale } = useI18n()
   const [selectedId, setSelectedId] = useState<string | null>(initialMaterialId ?? materials[0]?.id ?? null)
   const [relations, setRelations] = useState<MaterialRelation[]>([])
@@ -30,7 +31,7 @@ export function Explorer({ materials, topics, initialMaterialId, onSelect, onCha
   const [showHidden, setShowHidden] = useState(false)
   const [evidenceFocus, setEvidenceFocus] = useState<EvidenceFocus | null>(null)
   const selected = useMemo(() => materials.find((material) => material.id === selectedId) ?? null, [materials, selectedId])
-  useEffect(() => { if (initialMaterialId) { setSelectedId(initialMaterialId); setEvidenceFocus(null) } }, [initialMaterialId])
+  useEffect(() => { if (initialMaterialId) { setSelectedId(initialMaterialId); setEvidenceFocus(initialEvidenceFocus?.materialId === initialMaterialId ? initialEvidenceFocus : null) } }, [initialMaterialId, initialEvidenceFocus])
   const loadRelations = async (materialId: string): Promise<void> => {
     setLoading(true)
     setLoadError('')

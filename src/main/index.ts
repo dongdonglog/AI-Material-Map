@@ -98,6 +98,18 @@ function registerIpc(): void {
   })
   ipcMain.handle('topics:rebuildTopology', (_event, topicId: string) => workspace.rebuildSystemTopology(assertId(topicId, '主题标识')))
   ipcMain.handle('demo:create', () => resetLearningPathDemo(workspace))
+  ipcMain.handle('topics:wiki:get', (_event, topicId: string) => workspace.getTopicWiki(assertId(topicId, 'topic id')))
+  ipcMain.handle('topics:wiki:generate', (_event, topicId: string) => ai.generateTopicWiki(assertId(topicId, 'topic id')))
+  ipcMain.handle('topics:wiki:apply', (_event, topicId: string) => workspace.applyTopicWikiDraft(assertId(topicId, 'topic id')))
+  ipcMain.handle('topics:wiki:discard', (_event, topicId: string) => workspace.discardTopicWikiDraft(assertId(topicId, 'topic id')))
+  ipcMain.handle('topics:wiki:undo', (_event, topicId: string) => workspace.revertTopicWikiApply(assertId(topicId, 'topic id')))
+  ipcMain.handle('topics:wiki:runs', (_event, topicId: string) => workspace.listTopicWikiRuns(assertId(topicId, 'topic id')))
+  ipcMain.handle('topics:wiki:revisions', (_event, topicId: string) => workspace.listTopicWikiRevisions(assertId(topicId, 'topic id')))
+  ipcMain.handle('topics:wiki:revertRevision', (_event, topicId: string, version: number) => {
+    const revision = assertNumber(version, 'Wiki revision')
+    if (!Number.isInteger(revision) || revision < 1) throw new IpcValidationError('Wiki revision is invalid.')
+    return workspace.revertTopicWikiRevision(assertId(topicId, 'topic id'), revision)
+  })
   ipcMain.handle('workstreams:create', (_event, topicId: string, name: string) => workspace.createWorkstream(topicId, name))
   ipcMain.handle('workstreams:update', (_event, id: string, name: string) => workspace.updateWorkstream(id, name))
   ipcMain.handle('workstreams:updatePresentation', (_event, id: string, input: { color?: string; collapsed?: boolean }) => {

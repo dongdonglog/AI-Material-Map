@@ -1,9 +1,9 @@
-import { ClipboardCheck, Eye, Focus, LayoutDashboard, Maximize2, Network, Plus, Redo2, Sparkles, Undo2, Upload } from 'lucide-react'
+import { BookOpen, ClipboardCheck, Eye, Focus, LayoutDashboard, Maximize2, Network, Plus, Redo2, Sparkles, Undo2, Upload } from 'lucide-react'
 import { useEffect, useState, type ReactNode } from 'react'
 import { useI18n } from '../../i18n'
 
 /** 免模式工具栏：左键框选，拖动卡片移动，Space+左键/中键平移，拖端口连线。 */
-export function BoardToolbar({ onAdd, onImport, onLayout, onFit, onUndo, onRedo, onProposals, onAi, onToggleConfirmedOnly, onToggleSelectionFocus, viewMode = 'map', confirmedOnly = false, selectionFocus = false, proposalCount, proposalsOpen, canUndo, canRedo }: { onAdd(): void; onImport(): void; onLayout(): void; onFit(): void; onUndo(): void; onRedo(): void; onProposals(): void; onAi?(): void; onToggleConfirmedOnly?(): void; onToggleSelectionFocus?(): void; viewMode?: 'map' | 'flow'; confirmedOnly?: boolean; selectionFocus?: boolean; proposalCount: number; proposalsOpen: boolean; canUndo: boolean; canRedo: boolean }): React.ReactElement {
+export function BoardToolbar({ onAdd, onImport, onLayout, onFit, onUndo, onRedo, onProposals, onAi, onWiki, onToggleConfirmedOnly, onToggleSelectionFocus, viewMode = 'map', confirmedOnly = false, selectionFocus = false, proposalCount, proposalsOpen, canUndo, canRedo }: { onAdd(): void; onImport(): void; onLayout(): void; onFit(): void; onUndo(): void; onRedo(): void; onProposals(): void; onAi?(): void; onWiki?(): void; onToggleConfirmedOnly?(): void; onToggleSelectionFocus?(): void; viewMode?: 'map' | 'flow'; confirmedOnly?: boolean; selectionFocus?: boolean; proposalCount: number; proposalsOpen: boolean; canUndo: boolean; canRedo: boolean }): React.ReactElement {
   const [activeMode, setActiveMode] = useState(viewMode)
   const [activeConfirmedOnly, setActiveConfirmedOnly] = useState(confirmedOnly)
   const { t } = useI18n()
@@ -29,6 +29,7 @@ export function BoardToolbar({ onAdd, onImport, onLayout, onFit, onUndo, onRedo,
     <button className={activeConfirmedOnly ? 'active' : ''} aria-label={t('toolbar.confirmedOnly')} data-tooltip={t('toolbar.confirmedOnly')} onClick={() => { if (onToggleConfirmedOnly) { setActiveConfirmedOnly((current) => !current); onToggleConfirmedOnly() } else window.dispatchEvent(new CustomEvent('material-map:confirmed-only')) }}><Eye size={19} /></button>
     <button className={selectionFocus ? 'active' : ''} aria-label={t('toolbar.selectionFocus')} data-tooltip={t('toolbar.selectionFocus')} onClick={onToggleSelectionFocus}><Focus size={19} /></button>
     <button className="ai-tool" aria-label={t('toolbar.aiDraft')} data-tooltip={t('toolbar.aiDraft')} onClick={() => { if (onAi) onAi(); else window.dispatchEvent(new CustomEvent('material-map:ai')) }}><Sparkles size={19} /></button>
+    <button className="wiki-tool" aria-label={t('toolbar.wiki')} data-tooltip={t('toolbar.wiki')} onClick={onWiki}><BookOpen size={19} /></button>
     <button className={proposalsOpen ? 'active proposal-tool' : 'proposal-tool'} aria-label={t('toolbar.proposals')} data-tooltip={`${t('toolbar.proposals')}${proposalCount ? ` (${proposalCount})` : ''}`} onClick={onProposals}><ClipboardCheck size={19} />{proposalCount > 0 && <span>{proposalCount > 9 ? '9+' : proposalCount}</span>}</button>
     <hr />
     <button aria-label={t('toolbar.undo')} data-tooltip={t('toolbar.undo')} disabled={!canUndo} onClick={onUndo}><Undo2 size={19} /></button>

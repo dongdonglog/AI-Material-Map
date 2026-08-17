@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import type { AnalysisSummary, CanvasAiPlan, CanvasAiRequest, GroundedAnswer, KnowledgeChatTurn, KnowledgeQuestion, Material, MaterialAnalysisCard, ModelSettings, ProviderProfile, ProviderProfileInput, RelationAiExplanationFailureReason, RelationAiExplanationResult, SearchHit, TopicMap, TopicProposal, TopicRelationCandidate } from './types'
+import type { AnalysisSummary, CanvasAiPlan, CanvasAiRequest, GroundedAnswer, KnowledgeChatTurn, KnowledgeQuestion, Material, MaterialAnalysisCard, ModelSettings, ProviderProfile, ProviderProfileInput, RelationAiExplanationFailureReason, RelationAiExplanationResult, SearchHit, TopicMap, TopicProposal, TopicRelationCandidate, TopicWikiContent, TopicWikiDraft, TopicWikiPage } from './types'
 import { WorkspaceService } from './workspace-service'
 import { AppStore } from './app-store'
 import connectionSkill from './ai-skills/topic-connection.md?raw'
@@ -8,6 +8,7 @@ import { topicToolContext } from './topic-tools'
 import { chunkHash, tokenize } from './indexer'
 import { MaterialMapMcpServer } from './material-mcp'
 import { parseCanvasAiPlan } from './canvas-plan-validator'
+import { buildTopicWikiEvidencePacket, fallbackTopicWikiContent, fallbackTopicWikiOutline, outlinePrompt, parseModelJson, parseTopicWikiOutline, parseTopicWikiSection, sectionPrompt, type TopicWikiOutline, type TopicWikiSection } from './topic-wiki-generation'
 import { requiresCloudConsent } from '../shared/ai-provider'
 
 interface TopicAnalysisResult {
@@ -16,10 +17,14 @@ interface TopicAnalysisResult {
   relations: Array<{ sourceMaterialId: string; targetMaterialId: string; relationType?: string; label?: string; evidence: string; confidence?: number }>
 }
 
+class TopicWikiProviderError extends Error {}
+
 const workflowRelations: Record<string, string> = { next: '下一步', depends_on: '依赖', explains: '解释', evidences: '佐证', implements: '实现', tests: '验证', blocks: '阻塞', improves: '改进', reviews: '复盘', references: '参考', related: '关联' }
 export interface AiActionProposal { id: string; kind: 'create_relation' | 'create_workstream' | 'delete_ai_relation' | 'rename_relation' | 'set_sequence' | 'set_card_style' | 'layout'; reason: string; evidence: string; materialId?: string; relationId?: string; payload?: Record<string, unknown> }
 
 const workspaceCatalogBudget = 24_000
+const wikiOutlineTokens = 1_600
+const wikiSectionTokens: Record<TopicWikiSection, number> = { summary: 900, keyPoints: 1_600, relations: 1_600, openQuestions: 1_200 }
 
 function workspaceCatalog(materials: Material[]): { hits: SearchHit[]; omitted: number } {
   const hits: SearchHit[] = []
@@ -630,6 +635,97 @@ ${retrievalContext || '(none found; answer only from the catalog and summaries a
     return { ...plan, actions: plan.actions.map((action, index) => ({ ...action, id: proposals[index]?.id ?? action.id })) }
   }
 
+  async generateTopicWiki(topicId: string): Promise<TopicWikiPage> {
+    const map = this.workspace.topicMap(topicId)
+    const settings = this.workspace.getSettings()
+    if (!settings.enabled || !settings.chatModel) throw new Error('Enable a model before generating the topic Wiki.')
+    const profile = this.profileFor(settings)
+    if (this.needsCloudConsent(settings, profile) && !settings.allowCloud) throw new Error('Cloud Wiki generation requires explicit consent in settings.')
+    const wikiRuns = this.workspace as unknown as { startTopicWikiRun?: (id: string, revision: number, provider: string, model: string) => { id: string }; updateTopicWikiRun?: (id: string, stage: TopicWikiSection | 'outline' | 'saving', warnings?: string[]) => unknown; finishTopicWikiRun?: (id: string, status: 'complete' | 'partial' | 'failed', error?: string | null, warnings?: string[]) => unknown }
+    const run = wikiRuns.startTopicWikiRun?.(topicId, map.topic.revision, profile.provider, settings.chatModel)
+    const warnings: string[] = []
+    const updateRun = (stage: TopicWikiSection | 'outline' | 'saving'): void => { if (run) wikiRuns.updateTopicWikiRun?.(run.id, stage, warnings) }
+    const finishRun = (status: 'complete' | 'partial' | 'failed', error: string | null = null): void => { if (run) wikiRuns.finishTopicWikiRun?.(run.id, status, error, warnings) }
+    const chunksByMaterial = new Map(map.materials.map((material) => [material.id, this.workspace.listMaterialChunks(material.id)]))
+    const packet = buildTopicWikiEvidencePacket(map, chunksByMaterial)
+    if (!packet.materials.length) {
+      const error = 'Add indexed material to this topic before generating the Wiki.'
+      finishRun('failed', error)
+      throw new Error(error)
+    }
+    try {
+      const reasonCode = (error: unknown): string => {
+        const message = error instanceof Error ? error.message.toLowerCase() : ''
+        if (message.includes('truncated') || message.includes('length') || message.includes('max_tokens')) return 'truncated'
+        if (message.includes('empty response') || message.includes('no output')) return 'empty'
+        if (message.includes('no supported')) return 'unsupported'
+        return 'invalid-json'
+      }
+      const addFallback = (stage: string, error: unknown): void => {
+        warnings.push(`${stage}-fallback:${reasonCode(error)}`)
+      }
+      const requestStage = async <T>(prompt: string, operation: string, maxTokens: number, parse: (raw: string) => T): Promise<T> => {
+        let lastError: unknown = new Error(`${operation} returned invalid JSON.`)
+        for (let attempt = 0; attempt < 2; attempt += 1) {
+          try {
+            const retryPrompt = attempt === 0 ? prompt : `${prompt}\nRetry this stage. Return exactly one complete JSON object, with no Markdown, reasoning, or explanation. Keep every string concise so the object finishes within the output limit.`
+            const raw = await this.requestTopicWikiJson(profile, settings.chatModel, retryPrompt, operation, attempt === 0 ? maxTokens : Math.min(maxTokens * 2, 3_200))
+            return parse(raw)
+          } catch (error) {
+            if (error instanceof TopicWikiProviderError) throw error
+            lastError = error
+          }
+        }
+        throw lastError
+      }
+      let outline: TopicWikiOutline
+      updateRun('outline')
+      try {
+        outline = await requestStage(outlinePrompt(packet), 'Topic Wiki outline', wikiOutlineTokens, (raw) => {
+          const parsed = parseTopicWikiOutline(raw, packet)
+          if (!parsed.summaryFocus && !parsed.keyPoints.length && !parsed.relations.length && !parsed.openQuestions.length) throw new Error('The outline contained no supported Wiki items.')
+          return parsed
+        })
+      } catch (error) {
+        if (error instanceof TopicWikiProviderError) throw error
+        addFallback('outline', error)
+        outline = fallbackTopicWikiOutline(packet)
+      }
+      const content = fallbackTopicWikiContent(packet, outline)
+      const fill = async (section: TopicWikiSection): Promise<void> => {
+        const hasInputs = section === 'summary' || (section === 'keyPoints' ? outline.keyPoints.length > 0 : section === 'relations' ? outline.relations.length > 0 : outline.openQuestions.length > 0)
+        if (!hasInputs) return
+        updateRun(section)
+        try {
+          const parsed = await requestStage(sectionPrompt(section, packet, outline), `Topic Wiki ${section}`, wikiSectionTokens[section], (raw) => {
+            const result = parseTopicWikiSection(raw, section, packet)
+            if (section === 'summary' && !result.summary) throw new Error(`${section} returned no supported content.`)
+            if (section === 'keyPoints' && !result.keyPoints?.length) throw new Error(`${section} returned no supported content.`)
+            if (section === 'relations' && !result.relations?.length) throw new Error(`${section} returned no supported content.`)
+            if (section === 'openQuestions' && !result.openQuestions?.length) throw new Error(`${section} returned no supported content.`)
+            return result
+          })
+          if (section === 'summary' && parsed.summary) content.summary = parsed.summary
+          else if (section === 'keyPoints' && parsed.keyPoints?.length) content.keyPoints = parsed.keyPoints
+          else if (section === 'relations' && parsed.relations?.length) content.relations = parsed.relations
+          else if (section === 'openQuestions' && parsed.openQuestions?.length) content.openQuestions = parsed.openQuestions
+        } catch (error) {
+          if (error instanceof TopicWikiProviderError) throw error
+          addFallback(section, error)
+        }
+      }
+      for (const section of ['summary', 'keyPoints', 'relations', 'openQuestions'] as const) await fill(section)
+      updateRun('saving')
+      const draft: TopicWikiDraft = { content, baseRevision: map.topic.revision, generatedAt: new Date().toISOString(), provider: profile.provider, model: settings.chatModel, checks: [], runId: run?.id ?? null, warnings }
+      const saved = this.workspace.saveTopicWikiDraft(topicId, draft)
+      finishRun(warnings.length ? 'partial' : 'complete')
+      return saved
+    } catch (error) {
+      finishRun('failed', error instanceof Error ? error.message : 'Topic Wiki generation failed.')
+      throw error
+    }
+  }
+
   private materialCards(map: TopicMap, modelId: string): MaterialAnalysisCard[] {
     return map.materials.map((material) => {
       const cached = this.workspace.getMaterialAnalysisCard(material.id, modelId); if (cached) return cached
@@ -755,22 +851,50 @@ ${retrievalContext || '(none found; answer only from the catalog and summaries a
     } catch (error) { lastError = error instanceof Error ? error.message : lastError }
     throw new Error(lastError)
   }
+  private async requestTopicWikiJson(profile: ProviderProfile, model: string, prompt: string, operation: string, maxTokens: number): Promise<string> {
+    const response = await this.chatWithBudget(profile, model, prompt, true, maxTokens)
+    if (!response.ok) throw await this.topicWikiProviderError(response, operation)
+    const body = await this.responseJson(response, operation)
+    const finishReason = this.finishReason(body)
+    if (finishReason && /length|max_tokens|token_limit|insufficient_system_resource|content_filter/i.test(finishReason)) throw new Error(`${operation} was truncated or filtered by the model (${finishReason}).`)
+    const text = this.responseText(body, true)
+    if (!text.trim()) throw new Error(`${operation} returned an empty response.`)
+    return text
+  }
+  private async topicWikiProviderError(response: Response, operation: string): Promise<TopicWikiProviderError> {
+    let preview = ''
+    try {
+      const body = await response.text()
+      preview = body.replace(/Bearer\s+\S+/giu, 'Bearer [redacted]').replace(/sk-[A-Za-z0-9_-]+/gu, '[redacted]').replace(/\s+/gu, ' ').trim().slice(0, 600)
+    } catch { /* The HTTP status is still actionable when the provider closes the response body. */ }
+    return new TopicWikiProviderError(`${operation} request returned HTTP ${response.status}${preview ? `: ${preview}` : ''}`)
+  }
+  private finishReason(body: Record<string, unknown>): string | null {
+    const choice = (body.choices as Array<{ finish_reason?: unknown }> | undefined)?.[0]
+    const candidate = (body.candidates as Array<{ finishReason?: unknown }> | undefined)?.[0]
+    const response = body.response as Record<string, unknown> | undefined
+    const value = choice?.finish_reason ?? candidate?.finishReason ?? body.finish_reason ?? body.done_reason ?? response?.finish_reason
+    return typeof value === 'string' && value.trim() ? value.trim() : null
+  }
   private async chat(profile: ProviderProfile, model: string, prompt: string, json: boolean, parentSignal?: AbortSignal): Promise<Response> {
+    return this.chatWithBudget(profile, model, prompt, json, json ? 450 : 1000, parentSignal)
+  }
+  private async chatWithBudget(profile: ProviderProfile, model: string, prompt: string, json: boolean, maxTokens: number, parentSignal?: AbortSignal): Promise<Response> {
     const base = profile.baseUrl.replace(/\/$/, ''); const headers = { 'Content-Type': 'application/json', ...this.headers(profile) }
     const timeout = AbortSignal.timeout(90_000); const signal = parentSignal ? AbortSignal.any([timeout, parentSignal]) : timeout
-    const maxTokens = json ? 450 : 1000
     if (profile.provider === 'ollama') return fetch(`${base}/api/generate`, { method: 'POST', headers, signal, body: JSON.stringify({ model, prompt, stream: false, options: { num_predict: maxTokens, temperature: json ? 0.1 : 0.3 }, ...(json ? { format: 'json' } : {}) }) })
     if (profile.provider === 'anthropic') return fetch(`${base}/messages`, { method: 'POST', headers, signal, body: JSON.stringify({ model, max_tokens: maxTokens, messages: [{ role: 'user', content: prompt }], ...(json ? { temperature: 0.1 } : {}) }) })
     if (profile.provider === 'gemini') return fetch(`${base}/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(this.appStore.getApiKey(profile.id) ?? '')}`, { method: 'POST', headers, signal, body: JSON.stringify({ contents: [{ role: 'user', parts: [{ text: prompt }] }], generationConfig: { maxOutputTokens: maxTokens, ...(json ? { temperature: 0.1, responseMimeType: 'application/json' } : {}) } }) })
     if (profile.wireApi === 'responses') return fetch(`${base}/responses`, { method: 'POST', headers, signal, body: JSON.stringify({ model, input: prompt, store: false, max_output_tokens: maxTokens, ...(json ? { temperature: 0.1, text: { format: { type: 'json_object' } } } : {}) }) })
-    return fetch(`${base}/chat/completions`, { method: 'POST', headers, signal, body: JSON.stringify({ model, messages: [{ role: 'user', content: prompt }], max_tokens: maxTokens, ...(json ? { temperature: 0.1, response_format: { type: 'json_object' } } : {}) }) })
+    const deepSeekJson = json && profile.provider === 'compatible' && (/deepseek/i.test(model) || /deepseek\.com/i.test(base))
+    return fetch(`${base}/chat/completions`, { method: 'POST', headers, signal, body: JSON.stringify({ model, messages: [{ role: 'user', content: prompt }], max_tokens: maxTokens, ...(json ? { temperature: 0.1, response_format: { type: 'json_object' }, ...(deepSeekJson ? { thinking: { type: 'disabled' } } : {}) } : {}) }) })
   }
-  private responseText(body: Record<string, unknown>): string {
+  private responseText(body: Record<string, unknown>, structured = false): string {
     const direct = typeof body.output_text === 'string' ? body.output_text : undefined
     const output = (body.output as Array<{ content?: Array<{ text?: string }> }> | undefined)?.flatMap((item) => item.content ?? []).map((item) => item.text ?? '').join('')
     const firstChoice = (body.choices as Array<{ message?: { content?: string | Array<{ text?: string }>; reasoning_content?: string }; text?: string; delta?: { content?: string } }> | undefined)?.[0]
     const messageContent = firstChoice?.message?.content
-    const openAi = typeof messageContent === 'string' ? messageContent : Array.isArray(messageContent) ? messageContent.map((item) => item.text ?? '').join('') : firstChoice?.text ?? firstChoice?.delta?.content ?? firstChoice?.message?.reasoning_content
+    const openAi = typeof messageContent === 'string' ? messageContent : Array.isArray(messageContent) ? messageContent.map((item) => item.text ?? '').join('') : firstChoice?.text ?? firstChoice?.delta?.content ?? (structured ? undefined : firstChoice?.message?.reasoning_content)
     const anthropic = (body.content as Array<{ text?: string }> | undefined)?.map((item) => item.text ?? '').join('')
     const gemini = (body.candidates as Array<{ content?: { parts?: Array<{ text?: string }> } }> | undefined)?.[0]?.content?.parts?.map((part) => part.text ?? '').join('')
     return String(direct ?? output ?? body.response ?? openAi ?? anthropic ?? gemini ?? '')

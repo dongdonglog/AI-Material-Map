@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react'
 import { Archive, ArrowLeft, Plus, Search, Upload } from 'lucide-react'
 import type { Material, Topic, TopicMap, Workspace } from './types'
+import type { EvidenceFocus } from './lib/evidence-focus'
 import { syncImportNotices, type ImportNotice } from './import-state'
 import { TopicBoardPage as TopicBoard } from './features/topics/TopicBoardPage'
 import { SourcePanel } from './features/sources/SourcePanel'
@@ -28,6 +29,7 @@ export default function App(): React.ReactElement {
   const [showExplorer, setShowExplorer] = useState(false)
   const [showChat, setShowChat] = useState(false)
   const [explorerMaterialId, setExplorerMaterialId] = useState<string | null>(null)
+  const [explorerEvidenceFocus, setExplorerEvidenceFocus] = useState<EvidenceFocus | null>(null)
   const [activeTopic, setActiveTopic] = useState<TopicMap | null>(null)
   const [query, setQuery] = useState('')
   const [showNote, setShowNote] = useState(false)
@@ -69,6 +71,22 @@ export default function App(): React.ReactElement {
     window.addEventListener('materials:changed', changed)
     return () => window.removeEventListener('materials:changed', changed)
   }, [workspace])
+  useEffect(() => {
+    const openMaterial = (event: Event): void => {
+      const detail = (event as CustomEvent<unknown>).detail
+      const citation = detail && typeof detail === 'object' && !Array.isArray(detail) ? detail as Record<string, unknown> : null
+      const materialId = typeof detail === 'string' ? detail : typeof citation?.materialId === 'string' ? citation.materialId : ''
+      if (!materialId) return
+      const startOffset = typeof citation?.startOffset === 'number' && Number.isFinite(citation.startOffset) ? citation.startOffset : null
+      const endOffset = typeof citation?.endOffset === 'number' && Number.isFinite(citation.endOffset) ? citation.endOffset : null
+      const pageNumber = typeof citation?.pageNumber === 'number' && Number.isFinite(citation.pageNumber) ? citation.pageNumber : null
+      const heading = typeof citation?.heading === 'string' ? citation.heading : null
+      setExplorerEvidenceFocus(citation ? { key: `${materialId}:${String(citation.chunkId ?? '')}:${startOffset ?? ''}`, materialId, startOffset, endOffset, pageNumber, heading } : null)
+      setExplorerMaterialId(materialId); setActiveTopic(null); setShowExplorer(true); setShowChat(false); setSelected(null)
+    }
+    window.addEventListener('material-map:open-material', openMaterial)
+    return () => window.removeEventListener('material-map:open-material', openMaterial)
+  }, [])
   useEffect(() => {
     void refreshRecent()
     window.materialMap.workspace.onMenu('workspace:new', () => void createWorkspace())
@@ -239,6 +257,7 @@ export default function App(): React.ReactElement {
     }
   }
   const openExplorerById = (materialId: string) => {
+    setExplorerEvidenceFocus(null)
     setExplorerMaterialId(materialId)
     setShowExplorer(true)
     setShowChat(false)
@@ -339,7 +358,7 @@ export default function App(): React.ReactElement {
             onImportFiles={(paths, position) => importPaths(paths, false, { topicId: activeTopic.topic.id, position })}
           />
         ) : showExplorer ? (
-          <Explorer materials={materials} topics={topics} initialMaterialId={explorerMaterialId} onSelect={(material) => setExplorerMaterialId(material.id)} onChanged={refresh}/>
+          <Explorer materials={materials} topics={topics} initialMaterialId={explorerMaterialId} initialEvidenceFocus={explorerEvidenceFocus} onSelect={(material) => { setExplorerEvidenceFocus(null); setExplorerMaterialId(material.id) }} onChanged={refresh}/>
         ) : showChat ? (
           <KnowledgeChatPage key={workspace.id} workspaceId={workspace.id} settingsRevision={settingsRevision} onConfigure={() => setShowSettings(true)} onOpenCitation={(citation) => openExplorerById(citation.materialId)}/>
         ) : (
