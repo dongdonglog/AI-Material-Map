@@ -12,7 +12,7 @@ import { detectVectorCapability, type VectorCapability } from './db/vector-capab
 import { VectorStore } from './db/vector-store'
 import { NativeDatabase } from './db/native-database'
 import { stableTopicOrder, topologyPositions } from '../shared/topic-topology'
-import type { AnalysisStatus, Entity, EntityMention, EntityMentionSource, EntityType, FolderSource, Job, LineDash, Material, MaterialAnalysisCard, MaterialChunk, MaterialRelation, MaterialRelationStatus, MaterialTag, ModelSettings, Relation, RelationWaypoint, RelationshipEvidence, SearchHit, Topic, TopicAnalysisRun, TopicCandidateStatus, TopicEditorCommand, TopicHistoryStatus, TopicRelationCandidate, TopicRelationCandidateRecord, TopicMap, TopicProposal, WorkspaceSummary, Workstream } from './types'
+import type { AnalysisStatus, Entity, EntityMention, EntityMentionSource, EntityType, FolderSource, Job, LineDash, Material, MaterialAnalysisCard, MaterialChunk, MaterialRelation, MaterialRelationStatus, MaterialTag, ModelSettings, Relation, RelationWaypoint, RelationshipEvidence, SearchHit, Topic, TopicAnalysisRun, TopicCandidateStatus, TopicEditorCommand, TopicHistoryStatus, TopicRelationCandidate, TopicRelationCandidateRecord, TopicMap, TopicProposal, TopicProposalRun, TopicProposalRunStatus, TopicProposalSource, TopicViewMode, TopicWikiContent, TopicWikiDraft, TopicWikiEditSource, TopicWikiEvidence, TopicWikiPage, TopicWikiRevision, TopicWikiRun, TopicWikiRunStage, TopicWikiRunStatus, WorkspaceSummary, Workstream } from './types'
 
 type SqlRow = Record<string, unknown>
 interface WorkspaceConfig { id: string; name: string; encrypted: boolean; salt?: string }
@@ -111,8 +111,32 @@ function asMaterial(row: SqlRow): Material {
 }
 const topicPalette = ['#08776f', '#3568b8', '#a14569', '#b26a21', '#7654a6', '#3c7d66']
 function topicColor(id: string): string { return topicPalette[[...id].reduce((sum, char) => sum + char.charCodeAt(0), 0) % topicPalette.length] }
-function asTopic(row: SqlRow): Topic { return { ...row, id: String(row.id), name: String(row.name), description: row.description as string | null, createdAt: String(row.created_at), archivedAt: row.archived_at as string | null, color: String(row.color ?? topicColor(String(row.id))), revision: Number(row.revision ?? 0) } }
-function asWorkstream(row: SqlRow): Workstream { return { ...row, id: String(row.id), topicId: String(row.topic_id), name: String(row.name), position: Number(row.position), source: row.source as Workstream['source'] } }
+function workstreamColor(id: string): string { return topicPalette[([...id].reduce((sum, char) => sum + char.charCodeAt(0), 0) + 2) % topicPalette.length] }
+function asTopic(row: SqlRow): Topic { return { ...row, id: String(row.id), name: String(row.name), description: row.description as string | null, createdAt: String(row.created_at), archivedAt: row.archived_at as string | null, color: String(row.color ?? topicColor(String(row.id))), revision: Number(row.revision ?? 0), viewMode: row.view_mode === 'flow' ? 'flow' : 'map', confirmedOnly: Boolean(row.confirmed_only), focusedWorkstreamId: row.focused_workstream_id as string | null ?? null } }
+function parseWikiContent(value: unknown): TopicWikiContent | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+  const root = value as Record<string, unknown>
+  const bullets = (input: unknown): TopicWikiContent['keyPoints'] => Array.isArray(input) ? input.flatMap((item) => {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return []
+    const row = item as Record<string, unknown>
+    const evidence = Array.isArray(row.evidence) ? row.evidence.flatMap((entry) => {
+      if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return []
+      const source = entry as Record<string, unknown>
+      if (typeof source.materialId !== 'string' || typeof source.title !== 'string' || typeof source.excerpt !== 'string') return []
+      return [{ materialId: source.materialId, chunkId: typeof source.chunkId === 'string' ? source.chunkId : null, title: source.title.slice(0, 240), excerpt: source.excerpt.slice(0, 1200), heading: typeof source.heading === 'string' ? source.heading.slice(0, 240) : null, startOffset: typeof source.startOffset === 'number' && Number.isFinite(source.startOffset) ? source.startOffset : null, endOffset: typeof source.endOffset === 'number' && Number.isFinite(source.endOffset) ? source.endOffset : null, pageNumber: typeof source.pageNumber === 'number' && Number.isFinite(source.pageNumber) ? source.pageNumber : null } satisfies TopicWikiEvidence]
+    }) : []
+    return typeof row.text === 'string' && row.text.trim() ? [{ text: row.text.trim().slice(0, 1200), evidence }] : []
+  }).slice(0, 24) : []
+  const relations: TopicWikiContent['relations'] = Array.isArray(root.relations) ? root.relations.flatMap((item) => {
+    if (!item || typeof item !== 'object' || Array.isArray(item)) return []
+    const row = item as Record<string, unknown>
+    if (typeof row.sourceMaterialId !== 'string' || typeof row.targetMaterialId !== 'string' || typeof row.label !== 'string' || typeof row.explanation !== 'string') return []
+    const bullet = bullets([{ text: row.explanation, evidence: row.evidence }])[0]
+    return [{ sourceMaterialId: row.sourceMaterialId, targetMaterialId: row.targetMaterialId, label: row.label.trim().slice(0, 120), explanation: row.explanation.trim().slice(0, 1200), evidence: bullet?.evidence ?? [] }]
+  }).slice(0, 24) : []
+  return { summary: typeof root.summary === 'string' ? root.summary.trim().slice(0, 2400) : '', keyPoints: bullets(root.keyPoints), relations, openQuestions: bullets(root.openQuestions) }
+}
+function asWorkstream(row: SqlRow): Workstream { return { ...row, id: String(row.id), topicId: String(row.topic_id), name: String(row.name), position: Number(row.position), source: row.source as Workstream['source'], color: String(row.color ?? workstreamColor(String(row.id))), collapsed: Boolean(row.collapsed) } }
 function parseRoutePoints(value: unknown): RelationWaypoint[] {
   try {
     const parsed = JSON.parse(String(value ?? '[]'))
@@ -246,9 +270,10 @@ export class WorkspaceService {
   private initializeSchema(): void {
     this.requireDb().exec(`
       CREATE TABLE IF NOT EXISTS materials (id TEXT PRIMARY KEY, type TEXT NOT NULL, title TEXT NOT NULL, mime_type TEXT, source_path TEXT, stored_path TEXT, url TEXT, site_name TEXT, excerpt TEXT, extracted_text TEXT, imported_at TEXT NOT NULL, occurred_at TEXT, occurred_at_source TEXT NOT NULL, status TEXT NOT NULL, error TEXT, hash TEXT);
-      CREATE TABLE IF NOT EXISTS topics (id TEXT PRIMARY KEY, name TEXT NOT NULL, description TEXT, created_at TEXT NOT NULL, archived_at TEXT, color TEXT, revision INTEGER NOT NULL DEFAULT 0);
+      CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, name TEXT NOT NULL, applied_at TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS topics (id TEXT PRIMARY KEY, name TEXT NOT NULL, description TEXT, created_at TEXT NOT NULL, archived_at TEXT, color TEXT, revision INTEGER NOT NULL DEFAULT 0, view_mode TEXT NOT NULL DEFAULT 'map', confirmed_only INTEGER NOT NULL DEFAULT 0, focused_workstream_id TEXT);
       CREATE TABLE IF NOT EXISTS topic_materials (topic_id TEXT NOT NULL, material_id TEXT NOT NULL, workstream_id TEXT, canvas_x REAL, canvas_y REAL, position_source TEXT NOT NULL DEFAULT 'auto', card_color TEXT, card_tags TEXT, card_note TEXT, sequence INTEGER, sequence_source TEXT NOT NULL DEFAULT 'time', added_at TEXT, display_title TEXT, display_excerpt TEXT, card_width REAL, card_height REAL, card_text_color TEXT, card_font_size REAL, card_collapsed INTEGER NOT NULL DEFAULT 0, card_z_index INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(topic_id, material_id));
-      CREATE TABLE IF NOT EXISTS workstreams (id TEXT PRIMARY KEY, topic_id TEXT NOT NULL, name TEXT NOT NULL, position INTEGER NOT NULL, source TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS workstreams (id TEXT PRIMARY KEY, topic_id TEXT NOT NULL, name TEXT NOT NULL, position INTEGER NOT NULL, source TEXT NOT NULL, color TEXT, collapsed INTEGER NOT NULL DEFAULT 0);
       CREATE TABLE IF NOT EXISTS relations (id TEXT PRIMARY KEY, source_material_id TEXT NOT NULL, target_material_id TEXT NOT NULL, label TEXT NOT NULL, relation_type TEXT NOT NULL, evidence_text TEXT, evidence_material_id TEXT, confidence REAL, created_by TEXT NOT NULL, created_at TEXT NOT NULL, topic_id TEXT);
       CREATE TABLE IF NOT EXISTS topic_relation_styles (topic_id TEXT NOT NULL, relation_id TEXT NOT NULL, line_color TEXT, source_arrow INTEGER NOT NULL DEFAULT 0, source_arrow_style TEXT NOT NULL DEFAULT 'none', target_arrow_style TEXT NOT NULL DEFAULT 'triangle', animated INTEGER NOT NULL DEFAULT 1, archived INTEGER NOT NULL DEFAULT 0, branch_index INTEGER NOT NULL DEFAULT 0, line_kind TEXT NOT NULL DEFAULT 'auto', source_handle TEXT, target_handle TEXT, line_width REAL NOT NULL DEFAULT 2.75, line_dash TEXT NOT NULL DEFAULT 'auto', route_points TEXT NOT NULL DEFAULT '[]', label_anchor REAL NOT NULL DEFAULT .5, PRIMARY KEY(topic_id, relation_id));
       CREATE TABLE IF NOT EXISTS topic_editor_history (topic_id TEXT NOT NULL, sequence INTEGER NOT NULL, command_json TEXT NOT NULL, inverse_json TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY(topic_id, sequence));
@@ -258,7 +283,13 @@ export class WorkspaceService {
       CREATE TABLE IF NOT EXISTS folder_sources (id TEXT PRIMARY KEY, root_path TEXT NOT NULL UNIQUE, enabled INTEGER NOT NULL DEFAULT 1, include_patterns TEXT NOT NULL DEFAULT '[]', exclude_patterns TEXT NOT NULL DEFAULT '[]', watch_enabled INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS material_index_state (material_id TEXT PRIMARY KEY, source_id TEXT, availability TEXT NOT NULL DEFAULT 'available', last_indexed_at TEXT, last_seen_at TEXT);
       CREATE TABLE IF NOT EXISTS material_chunks (id TEXT PRIMARY KEY, material_id TEXT NOT NULL, ordinal INTEGER NOT NULL, text TEXT NOT NULL, start_offset INTEGER NOT NULL, end_offset INTEGER NOT NULL, page_number INTEGER, heading TEXT, hash TEXT NOT NULL, indexed_at TEXT NOT NULL);
-      CREATE TABLE IF NOT EXISTS topic_proposals (id TEXT PRIMARY KEY, topic_id TEXT NOT NULL, kind TEXT NOT NULL, reason TEXT NOT NULL, evidence TEXT NOT NULL, material_id TEXT, relation_id TEXT, payload TEXT NOT NULL DEFAULT '{}', status TEXT NOT NULL DEFAULT 'pending', created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS topic_proposal_runs (id TEXT PRIMARY KEY, topic_id TEXT NOT NULL, base_revision INTEGER NOT NULL, instruction TEXT NOT NULL, provider TEXT NOT NULL, model TEXT NOT NULL, summary TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending', created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS topic_proposals (id TEXT PRIMARY KEY, topic_id TEXT NOT NULL, kind TEXT NOT NULL, reason TEXT NOT NULL, evidence TEXT NOT NULL, material_id TEXT, relation_id TEXT, payload TEXT NOT NULL DEFAULT '{}', status TEXT NOT NULL DEFAULT 'pending', created_at TEXT NOT NULL, updated_at TEXT NOT NULL, run_id TEXT, base_revision INTEGER, source TEXT NOT NULL DEFAULT 'legacy');
+      CREATE TABLE IF NOT EXISTS topic_wiki_pages (topic_id TEXT PRIMARY KEY, page_type TEXT NOT NULL DEFAULT 'overview', content_json TEXT, source_revision INTEGER, draft_json TEXT, draft_revision INTEGER, previous_content_json TEXT, previous_source_revision INTEGER, undo_available INTEGER NOT NULL DEFAULT 0, version INTEGER NOT NULL DEFAULT 0, last_edit_source TEXT, last_provider TEXT, last_model TEXT, updated_at TEXT);
+      CREATE TABLE IF NOT EXISTS topic_wiki_runs (id TEXT PRIMARY KEY, topic_id TEXT NOT NULL, base_revision INTEGER NOT NULL, provider TEXT NOT NULL, model TEXT NOT NULL, status TEXT NOT NULL, stage TEXT NOT NULL, error TEXT, warnings_json TEXT NOT NULL DEFAULT '[]', started_at TEXT NOT NULL, completed_at TEXT, updated_at TEXT NOT NULL);
+      CREATE INDEX IF NOT EXISTS topic_wiki_runs_topic_idx ON topic_wiki_runs(topic_id, updated_at DESC);
+      CREATE TABLE IF NOT EXISTS topic_wiki_revisions (id TEXT PRIMARY KEY, topic_id TEXT NOT NULL, version INTEGER NOT NULL, content_json TEXT NOT NULL, source_revision INTEGER NOT NULL, edit_source TEXT NOT NULL, provider TEXT, model TEXT, created_at TEXT NOT NULL, UNIQUE(topic_id, version));
+      CREATE INDEX IF NOT EXISTS topic_wiki_revisions_topic_idx ON topic_wiki_revisions(topic_id, version DESC);
       CREATE TABLE IF NOT EXISTS material_analysis_cards (material_id TEXT NOT NULL, content_hash TEXT NOT NULL, model_id TEXT NOT NULL, title TEXT NOT NULL, date TEXT, headings TEXT NOT NULL, keywords TEXT NOT NULL, evidence_chunk_ids TEXT NOT NULL, summary TEXT NOT NULL, generated_at TEXT NOT NULL, PRIMARY KEY(material_id, content_hash, model_id));
       CREATE TABLE IF NOT EXISTS topic_analysis_runs (id TEXT PRIMARY KEY, topic_id TEXT NOT NULL, topic_revision INTEGER NOT NULL, stage TEXT NOT NULL, completed INTEGER NOT NULL DEFAULT 0, total INTEGER NOT NULL DEFAULT 0, added_relations INTEGER NOT NULL DEFAULT 0, rejected_candidates INTEGER NOT NULL DEFAULT 0, error TEXT, summary TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS material_tags (material_id TEXT NOT NULL, tag TEXT NOT NULL, source TEXT NOT NULL, weight REAL NOT NULL, PRIMARY KEY(material_id, tag));
@@ -272,12 +303,29 @@ export class WorkspaceService {
       CREATE TABLE IF NOT EXISTS relationship_evidence (id TEXT PRIMARY KEY, relation_id TEXT NOT NULL, type TEXT NOT NULL, score REAL NOT NULL, source_material_id TEXT NOT NULL, target_material_id TEXT NOT NULL, source_entity_id TEXT, target_entity_id TEXT, source_offset INTEGER, target_offset INTEGER, text TEXT NOT NULL, created_at TEXT NOT NULL);
       CREATE INDEX IF NOT EXISTS relationship_evidence_relation_idx ON relationship_evidence(relation_id);
     `)
+    this.requireDb().run("INSERT OR IGNORE INTO schema_migrations (version, name, applied_at) VALUES (1, 'baseline', ?)", [now()])
+    this.requireDb().run("INSERT OR IGNORE INTO schema_migrations (version, name, applied_at) VALUES (2, 'canvas-ai-proposals-and-view-preferences', ?)", [now()])
+    this.requireDb().run("INSERT OR IGNORE INTO schema_migrations (version, name, applied_at) VALUES (3, 'workstream-presentation-and-focus', ?)", [now()])
+    this.requireDb().run("INSERT OR IGNORE INTO schema_migrations (version, name, applied_at) VALUES (4, 'topic-wiki-overview', ?)", [now()])
+    this.requireDb().run("INSERT OR IGNORE INTO schema_migrations (version, name, applied_at) VALUES (5, 'topic-wiki-undo', ?)", [now()])
+    this.requireDb().run("INSERT OR IGNORE INTO schema_migrations (version, name, applied_at) VALUES (6, 'topic-wiki-runs-and-revisions', ?)", [now()])
     try { this.requireDb().run('CREATE VIRTUAL TABLE IF NOT EXISTS material_chunks_fts USING fts5(chunk_id UNINDEXED, material_id UNINDEXED, title, text, heading)'); this.ftsEnabled = true } catch { this.ftsEnabled = false }
     const topicTableColumns = this.query('PRAGMA table_info(topics)').map((row) => String(row.name))
     if (!topicTableColumns.includes('archived_at')) this.requireDb().run('ALTER TABLE topics ADD COLUMN archived_at TEXT')
     if (!topicTableColumns.includes('color')) this.requireDb().run('ALTER TABLE topics ADD COLUMN color TEXT')
     if (!topicTableColumns.includes('revision')) this.requireDb().run('ALTER TABLE topics ADD COLUMN revision INTEGER NOT NULL DEFAULT 0')
+    if (!topicTableColumns.includes('view_mode')) this.requireDb().run("ALTER TABLE topics ADD COLUMN view_mode TEXT NOT NULL DEFAULT 'map'")
+    if (!topicTableColumns.includes('confirmed_only')) this.requireDb().run('ALTER TABLE topics ADD COLUMN confirmed_only INTEGER NOT NULL DEFAULT 0')
+    if (!topicTableColumns.includes('focused_workstream_id')) this.requireDb().run('ALTER TABLE topics ADD COLUMN focused_workstream_id TEXT')
     for (const topic of this.query("SELECT id FROM topics WHERE color IS NULL OR color=''")) this.requireDb().run('UPDATE topics SET color=? WHERE id=?', [topicColor(String(topic.id)), String(topic.id)])
+    const wikiColumns = this.query('PRAGMA table_info(topic_wiki_pages)').map((row) => String(row.name))
+    if (!wikiColumns.includes('previous_content_json')) this.requireDb().run('ALTER TABLE topic_wiki_pages ADD COLUMN previous_content_json TEXT')
+    if (!wikiColumns.includes('previous_source_revision')) this.requireDb().run('ALTER TABLE topic_wiki_pages ADD COLUMN previous_source_revision INTEGER')
+    if (!wikiColumns.includes('undo_available')) this.requireDb().run('ALTER TABLE topic_wiki_pages ADD COLUMN undo_available INTEGER NOT NULL DEFAULT 0')
+    if (!wikiColumns.includes('version')) this.requireDb().run('ALTER TABLE topic_wiki_pages ADD COLUMN version INTEGER NOT NULL DEFAULT 0')
+    if (!wikiColumns.includes('last_edit_source')) this.requireDb().run('ALTER TABLE topic_wiki_pages ADD COLUMN last_edit_source TEXT')
+    if (!wikiColumns.includes('last_provider')) this.requireDb().run('ALTER TABLE topic_wiki_pages ADD COLUMN last_provider TEXT')
+    if (!wikiColumns.includes('last_model')) this.requireDb().run('ALTER TABLE topic_wiki_pages ADD COLUMN last_model TEXT')
     const topicColumns = this.query('PRAGMA table_info(topic_materials)').map((row) => String(row.name))
     if (!topicColumns.includes('canvas_x')) this.requireDb().run('ALTER TABLE topic_materials ADD COLUMN canvas_x REAL')
     if (!topicColumns.includes('canvas_y')) this.requireDb().run('ALTER TABLE topic_materials ADD COLUMN canvas_y REAL')
@@ -297,6 +345,14 @@ export class WorkspaceService {
     if (!topicColumns.includes('card_collapsed')) this.requireDb().run('ALTER TABLE topic_materials ADD COLUMN card_collapsed INTEGER NOT NULL DEFAULT 0')
     if (!topicColumns.includes('card_z_index')) this.requireDb().run('ALTER TABLE topic_materials ADD COLUMN card_z_index INTEGER NOT NULL DEFAULT 0')
     this.requireDb().run('UPDATE topic_materials SET added_at=COALESCE(added_at, ?) WHERE added_at IS NULL', [now()])
+    const proposalColumns = this.query('PRAGMA table_info(topic_proposals)').map((row) => String(row.name))
+    if (!proposalColumns.includes('run_id')) this.requireDb().run('ALTER TABLE topic_proposals ADD COLUMN run_id TEXT')
+    if (!proposalColumns.includes('base_revision')) this.requireDb().run('ALTER TABLE topic_proposals ADD COLUMN base_revision INTEGER')
+    if (!proposalColumns.includes('source')) this.requireDb().run("ALTER TABLE topic_proposals ADD COLUMN source TEXT NOT NULL DEFAULT 'legacy'")
+    const workstreamColumns = this.query('PRAGMA table_info(workstreams)').map((row) => String(row.name))
+    if (!workstreamColumns.includes('color')) this.requireDb().run('ALTER TABLE workstreams ADD COLUMN color TEXT')
+    if (!workstreamColumns.includes('collapsed')) this.requireDb().run('ALTER TABLE workstreams ADD COLUMN collapsed INTEGER NOT NULL DEFAULT 0')
+    for (const stream of this.query("SELECT id FROM workstreams WHERE color IS NULL OR color=''")) this.requireDb().run('UPDATE workstreams SET color=? WHERE id=?', [workstreamColor(String(stream.id)), String(stream.id)])
     const relationStyleColumns = this.query('PRAGMA table_info(topic_relation_styles)').map((row) => String(row.name))
     const relationColumns = this.query('PRAGMA table_info(relations)').map((row) => String(row.name))
     if (!relationColumns.includes('topic_id')) this.requireDb().run('ALTER TABLE relations ADD COLUMN topic_id TEXT')
@@ -435,11 +491,13 @@ export class WorkspaceService {
   renameMaterial(materialId: string, title: string): Material {
     if (!title.trim()) throw new Error('Material title cannot be empty.')
     this.run('UPDATE materials SET title=? WHERE id=?', [title.trim(), materialId])
+    this.bumpTopicsForMaterial(materialId); this.persist()
     const material = this.getMaterial(materialId); if (!material) throw new Error('Material not found.')
     return material
   }
   deleteMaterial(materialId: string): void {
     const material = this.getMaterial(materialId); if (!material) return
+    this.bumpTopicsForMaterial(materialId)
     const relationIds = this.query('SELECT id FROM material_relations WHERE source_material_id=? OR target_material_id=?', [materialId, materialId]).map((row) => String(row.id))
     for (const relationId of relationIds) this.requireDb().run('DELETE FROM relationship_evidence WHERE relation_id=?', [relationId])
     this.requireDb().run('DELETE FROM material_relations WHERE source_material_id=? OR target_material_id=?', [materialId, materialId])
@@ -500,8 +558,8 @@ export class WorkspaceService {
     }
   }
   retry(materialId: string): void { void this.enqueueProcessing(materialId) }
-  updateMaterialDate(id: string, occurredAt: string): void { this.run('UPDATE materials SET occurred_at=?, occurred_at_source=? WHERE id=?', [occurredAt, 'manual', id]) }
-  createTopic(name: string, description = ''): Topic { const topicId = id(); const topic = { id: topicId, name, description: description || null, createdAt: now(), archivedAt: null, color: topicColor(topicId), revision: 0 }; this.run('INSERT INTO topics (id, name, description, created_at, archived_at, color, revision) VALUES (?, ?, ?, ?, ?, ?, ?)', [topic.id, topic.name, topic.description, topic.createdAt, null, topic.color, topic.revision]); return topic }
+  updateMaterialDate(id: string, occurredAt: string): void { this.run('UPDATE materials SET occurred_at=?, occurred_at_source=? WHERE id=?', [occurredAt, 'manual', id]); this.bumpTopicsForMaterial(id); this.persist() }
+  createTopic(name: string, description = ''): Topic { const topicId = id(); const topic = { id: topicId, name, description: description || null, createdAt: now(), archivedAt: null, color: topicColor(topicId), revision: 0, viewMode: 'map' as const, confirmedOnly: false, focusedWorkstreamId: null }; this.run('INSERT INTO topics (id, name, description, created_at, archived_at, color, revision, view_mode, confirmed_only, focused_workstream_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', [topic.id, topic.name, topic.description, topic.createdAt, null, topic.color, topic.revision, topic.viewMode, 0, null]); return topic }
   listTopics(): Topic[] { return this.query('SELECT * FROM topics WHERE archived_at IS NULL ORDER BY created_at DESC').map(asTopic) }
   listArchivedTopics(): Topic[] { return this.query('SELECT * FROM topics WHERE archived_at IS NOT NULL ORDER BY archived_at DESC').map(asTopic) }
   archiveTopic(topicId: string): void { this.run('UPDATE topics SET archived_at=? WHERE id=? AND archived_at IS NULL', [now(), topicId]); this.persist() }
@@ -525,6 +583,9 @@ export class WorkspaceService {
     this.requireDb().run('DELETE FROM topic_materials WHERE topic_id=?', [topicId])
     this.requireDb().run('DELETE FROM topic_editor_history WHERE topic_id=?', [topicId])
     this.requireDb().run('DELETE FROM topic_editor_history_state WHERE topic_id=?', [topicId])
+    this.requireDb().run('DELETE FROM topic_wiki_pages WHERE topic_id=?', [topicId])
+    this.requireDb().run('DELETE FROM topic_wiki_runs WHERE topic_id=?', [topicId])
+    this.requireDb().run('DELETE FROM topic_wiki_revisions WHERE topic_id=?', [topicId])
     this.requireDb().run('DELETE FROM topics WHERE id=?', [topicId]); this.persist()
   }
   resetTopicBoard(topicId: string, removeSharedRelations = false): void {
@@ -560,15 +621,44 @@ export class WorkspaceService {
   updateCardOrder(topicId: string, materialId: string, sequence: number): void { if (!Number.isInteger(sequence) || sequence < 1) throw new Error('Sequence must be a positive integer.'); this.run("UPDATE topic_materials SET sequence=?, sequence_source='manual' WHERE topic_id=? AND material_id=?", [sequence, topicId, materialId]); this.rebuildSystemTopology(topicId) }
   resetCardOrder(topicId: string): void { this.run("UPDATE topic_materials SET sequence=NULL, sequence_source='time' WHERE topic_id=?", [topicId]); this.rebuildSystemTopology(topicId) }
   removeFromTopic(topicId: string, materialId: string): void { this.run('DELETE FROM topic_materials WHERE topic_id=? AND material_id=?', [topicId, materialId]); this.rebuildSystemTopology(topicId) }
-  createWorkstream(topicId: string, name: string, source: 'ai' | 'manual' = 'manual'): Workstream { const position = this.query('SELECT COUNT(*) AS count FROM workstreams WHERE topic_id=?', [topicId])[0]?.count as number ?? 0; const stream = { id: id(), topicId, name, position: Number(position), source }; this.run('INSERT INTO workstreams VALUES (?, ?, ?, ?, ?)', [stream.id, stream.topicId, stream.name, stream.position, stream.source]); this.persist(); return stream }
+  updateTopicViewPreferences(topicId: string, input: { viewMode?: TopicViewMode; confirmedOnly?: boolean; focusedWorkstreamId?: string | null }): Topic {
+    const current = first<SqlRow>(this.query('SELECT * FROM topics WHERE id=?', [topicId])); if (!current) throw new Error('Topic not found.')
+    const viewMode = input.viewMode === undefined ? (current.view_mode === 'flow' ? 'flow' : 'map') : input.viewMode
+    if (viewMode !== 'map' && viewMode !== 'flow') throw new Error('Unsupported topic view mode.')
+    const confirmedOnly = input.confirmedOnly === undefined ? Boolean(current.confirmed_only) : Boolean(input.confirmedOnly)
+    const focusedWorkstreamId = input.focusedWorkstreamId === undefined ? current.focused_workstream_id as string | null : input.focusedWorkstreamId
+    if (focusedWorkstreamId !== null && !this.query('SELECT id FROM workstreams WHERE id=? AND topic_id=?', [focusedWorkstreamId, topicId])[0]) throw new Error('Focused workstream is not part of this topic.')
+    this.run('UPDATE topics SET view_mode=?, confirmed_only=?, focused_workstream_id=? WHERE id=?', [viewMode, confirmedOnly ? 1 : 0, focusedWorkstreamId, topicId])
+    return asTopic(first<SqlRow>(this.query('SELECT * FROM topics WHERE id=?', [topicId]))!)
+  }
+  topicRevision(topicId: string): number {
+    const row = this.query('SELECT revision FROM topics WHERE id=?', [topicId])[0]; if (!row) throw new Error('Topic not found.')
+    return Number(row.revision ?? 0)
+  }
+  createWorkstream(topicId: string, name: string, source: 'ai' | 'manual' = 'manual'): Workstream { const position = this.query('SELECT COUNT(*) AS count FROM workstreams WHERE topic_id=?', [topicId])[0]?.count as number ?? 0; const streamId = id(); const stream: Workstream = { id: streamId, topicId, name, position: Number(position), source, color: workstreamColor(streamId), collapsed: false }; this.run('INSERT INTO workstreams (id, topic_id, name, position, source, color, collapsed) VALUES (?, ?, ?, ?, ?, ?, ?)', [stream.id, stream.topicId, stream.name, stream.position, stream.source, stream.color, 0]); return stream }
   updateWorkstream(id: string, name: string): void { this.run('UPDATE workstreams SET name=? WHERE id=?', [name, id]) }
+  updateWorkstreamPresentation(id: string, input: { color?: string; collapsed?: boolean }): Workstream {
+    const current = first<SqlRow>(this.query('SELECT * FROM workstreams WHERE id=?', [id])); if (!current) throw new Error('Workstream not found.')
+    const color = input.color === undefined ? String(current.color ?? workstreamColor(id)) : normalizeColor(input.color)
+    if (!color) throw new Error('Workstream color must be a six-digit hexadecimal value.')
+    const collapsed = input.collapsed === undefined ? Boolean(current.collapsed) : input.collapsed
+    this.run('UPDATE workstreams SET color=?, collapsed=? WHERE id=?', [color, collapsed ? 1 : 0, id])
+    return asWorkstream(first<SqlRow>(this.query('SELECT * FROM workstreams WHERE id=?', [id]))!)
+  }
   deleteWorkstream(id: string): void {
     // Relations belong to materials, so deleting a lane only clears its grouping.
     this.run('UPDATE topic_materials SET workstream_id=NULL WHERE workstream_id=?', [id])
+    this.requireDb().run('UPDATE topics SET focused_workstream_id=NULL WHERE focused_workstream_id=?', [id])
     this.run('DELETE FROM workstreams WHERE id=?', [id])
   }
   moveMaterial(topicId: string, materialId: string, workstreamId: string | null): void { this.run('UPDATE topic_materials SET workstream_id=? WHERE topic_id=? AND material_id=?', [workstreamId, topicId, materialId]); this.persist() }
   private bumpTopicRevision(topicId: string): void { this.requireDb().run('UPDATE topics SET revision=revision+1 WHERE id=?', [topicId]) }
+  private bumpTopicsForMaterial(materialId: string): void {
+    for (const row of this.query('SELECT topic_id FROM topic_materials WHERE material_id=?', [materialId])) this.bumpTopicRevision(String(row.topic_id))
+  }
+  private bumpTopicsForRelation(sourceMaterialId: string, targetMaterialId: string): void {
+    for (const row of this.query('SELECT source.topic_id FROM topic_materials source JOIN topic_materials target ON target.topic_id=source.topic_id WHERE source.material_id=? AND target.material_id=?', [sourceMaterialId, targetMaterialId])) this.bumpTopicRevision(String(row.topic_id))
+  }
   positionMaterial(topicId: string, materialId: string, x: number, y: number): void { this.requireDb().run("UPDATE topic_materials SET canvas_x=?, canvas_y=?, position_source='manual' WHERE topic_id=? AND material_id=?", [x, y, topicId, materialId]); this.bumpTopicRevision(topicId); this.persist() }
   positionMaterials(topicId: string, positions: Array<{ materialId: string; x: number; y: number }>): void { for (const position of positions) this.requireDb().run("UPDATE topic_materials SET canvas_x=?, canvas_y=?, position_source='manual' WHERE topic_id=? AND material_id=?", [position.x, position.y, topicId, position.materialId]); this.bumpTopicRevision(topicId); this.persist() }
   updateCardStyle(topicId: string, materialId: string, input: { color?: string | null; tags?: string[]; note?: string | null }): void {
@@ -670,6 +760,17 @@ export class WorkspaceService {
   }
   private applyTopicEditorCommand(topicId: string, command: TopicEditorCommand): { inverse: TopicEditorCommand; forward?: TopicEditorCommand } {
     const payload = this.commandRecord(command.payload)
+    if (command.kind === 'batch') {
+      const commands = payload.commands
+      if (!Array.isArray(commands) || !commands.length || commands.length > 64) throw new Error('Batch editor command is invalid.')
+      const forward: TopicEditorCommand[] = []; const inverse: TopicEditorCommand[] = []
+      for (const value of commands) {
+        const child = this.commandRecord(value) as TopicEditorCommand
+        const result = this.applyTopicEditorCommand(topicId, child)
+        forward.push(result.forward ?? child); inverse.unshift(result.inverse)
+      }
+      return { forward: { kind: 'batch', payload: { commands: forward } }, inverse: { kind: 'batch', payload: { commands: inverse } } }
+    }
     if (command.kind === 'moveCards') {
       const positions = payload.positions
       if (!Array.isArray(positions) || !positions.length || positions.length > 500) throw new Error('Card positions are invalid.')
@@ -734,9 +835,16 @@ export class WorkspaceService {
       const workstreamId = payload.workstreamId ? this.commandId(payload.workstreamId, 'Workstream id') : id()
       if (this.query('SELECT id FROM workstreams WHERE id=?', [workstreamId])[0]) throw new Error('Workstream already exists.')
       const position = Number(this.query('SELECT COUNT(*) AS count FROM workstreams WHERE topic_id=?', [topicId])[0]?.count ?? 0)
-      this.requireDb().run('INSERT INTO workstreams VALUES (?, ?, ?, ?, ?)', [workstreamId, topicId, name, position, 'ai'])
+      const color = payload.color === undefined
+        ? workstreamColor(workstreamId)
+        : typeof payload.color === 'string'
+          ? normalizeColor(payload.color)
+          : null
+      if (!color) throw new Error('Workstream color must be a six-digit hexadecimal value.')
+      const collapsed = payload.collapsed === true
+      this.requireDb().run('INSERT INTO workstreams (id, topic_id, name, position, source, color, collapsed) VALUES (?, ?, ?, ?, ?, ?, ?)', [workstreamId, topicId, name, position, 'ai', color, collapsed ? 1 : 0])
       for (const materialId of materialIds) this.requireDb().run('UPDATE topic_materials SET workstream_id=? WHERE topic_id=? AND material_id=?', [workstreamId, topicId, materialId])
-      return { forward: { kind: 'createWorkstream', payload: { workstreamId, name, materialIds } }, inverse: { kind: 'removeWorkstream', payload: { workstreamId, previousAssignments } } }
+      return { forward: { kind: 'createWorkstream', payload: { workstreamId, name, materialIds, color, collapsed } }, inverse: { kind: 'removeWorkstream', payload: { workstreamId, previousAssignments } } }
     }
     if (command.kind === 'removeWorkstream') {
       const workstreamId = this.commandId(payload.workstreamId, 'Workstream id'); const stream = this.query('SELECT * FROM workstreams WHERE id=? AND topic_id=?', [workstreamId, topicId])[0]
@@ -750,7 +858,7 @@ export class WorkspaceService {
       }
       this.requireDb().run('UPDATE topic_materials SET workstream_id=NULL WHERE topic_id=? AND workstream_id=?', [topicId, workstreamId])
       this.requireDb().run('DELETE FROM workstreams WHERE id=?', [workstreamId])
-      return { inverse: { kind: 'createWorkstream', payload: { workstreamId, name: String(stream.name), materialIds: currentMaterialIds } } }
+      return { inverse: { kind: 'createWorkstream', payload: { workstreamId, name: String(stream.name), materialIds: currentMaterialIds, color: String(stream.color ?? workstreamColor(workstreamId)), collapsed: Boolean(stream.collapsed) } } }
     }
     if (command.kind === 'reconnectRelation') {
       const relationId = this.commandId(payload.relationId, 'Relation id'); const row = this.query('SELECT * FROM relations WHERE id=?', [relationId])[0]
@@ -832,17 +940,19 @@ export class WorkspaceService {
     }
     throw new Error(`Unsupported editor command: ${command.kind}`)
   }
-  executeTopicEditorCommand(topicId: string, command: TopicEditorCommand): void {
+  executeTopicEditorCommands(topicId: string, commands: TopicEditorCommand[]): void {
+    if (!commands.length || commands.length > 64) throw new Error('Editor command list is invalid.')
     this.withTransaction(() => {
       if (!this.query('SELECT id FROM topics WHERE id=?', [topicId])[0]) throw new Error('Topic not found.')
-      const result = this.applyTopicEditorCommand(topicId, command)
+      const result = this.applyTopicEditorCommand(topicId, { kind: 'batch', payload: { commands } })
       const state = this.topicHistoryStatus(topicId); const sequence = state.cursor + 1
       this.requireDb().run('DELETE FROM topic_editor_history WHERE topic_id=? AND sequence>?', [topicId, state.cursor])
-      this.requireDb().run('INSERT OR REPLACE INTO topic_editor_history (topic_id, sequence, command_json, inverse_json, created_at) VALUES (?, ?, ?, ?, ?)', [topicId, sequence, JSON.stringify(result.forward ?? command), JSON.stringify(result.inverse), now()])
+      this.requireDb().run('INSERT OR REPLACE INTO topic_editor_history (topic_id, sequence, command_json, inverse_json, created_at) VALUES (?, ?, ?, ?, ?)', [topicId, sequence, JSON.stringify(result.forward), JSON.stringify(result.inverse), now()])
       this.requireDb().run('INSERT OR REPLACE INTO topic_editor_history_state (topic_id, cursor) VALUES (?, ?)', [topicId, sequence])
       this.bumpTopicRevision(topicId)
     })
   }
+  executeTopicEditorCommand(topicId: string, command: TopicEditorCommand): void { this.executeTopicEditorCommands(topicId, [command]) }
   undoTopicEditorCommand(topicId: string): TopicHistoryStatus {
     return this.withTransaction(() => {
       const state = this.topicHistoryStatus(topicId); if (!state.undo) return state
@@ -878,7 +988,14 @@ export class WorkspaceService {
     } catch (error) { this.requireDb().exec('ROLLBACK'); throw error }
   }
   private rebuildExistingSystemTopologies(): void {
-    for (const row of this.query('SELECT id FROM topics WHERE archived_at IS NULL')) this.rebuildSystemTopology(String(row.id))
+    for (const row of this.query('SELECT id FROM topics WHERE archived_at IS NULL')) {
+      const topicId = String(row.id)
+      const counts = this.query('SELECT COUNT(*) AS total, SUM(CASE WHEN canvas_x IS NOT NULL AND canvas_y IS NOT NULL THEN 1 ELSE 0 END) AS positioned FROM topic_materials WHERE topic_id=?', [topicId])[0]
+      // Existing v1.5 boards already have stable coordinates. Rebuilding them
+      // while opening a workspace would create a false revision conflict for
+      // every pending AI proposal. Only initialize genuinely legacy boards.
+      if (Number(counts?.total ?? 0) > 0 && Number(counts?.positioned ?? 0) === 0) this.rebuildSystemTopology(topicId)
+    }
   }
   createRelation(input: Omit<Relation, 'id' | 'createdAt'>): Relation {
     if (input.sourceMaterialId === input.targetMaterialId) throw new Error('A material cannot be related to itself.')
@@ -889,6 +1006,7 @@ export class WorkspaceService {
     const relation = { id: id(), ...input, createdAt: now() }
     this.run('INSERT INTO relations (id, source_material_id, target_material_id, label, relation_type, evidence_text, evidence_material_id, confidence, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', [relation.id, relation.sourceMaterialId, relation.targetMaterialId, relation.label, relation.relationType, relation.evidenceText, relation.evidenceMaterialId, relation.confidence, relation.createdBy, relation.createdAt])
     if (relation.createdBy === 'manual') this.run("DELETE FROM relations WHERE created_by='system' AND source_material_id=? AND target_material_id=?", [relation.sourceMaterialId, relation.targetMaterialId])
+    this.bumpTopicsForRelation(relation.sourceMaterialId, relation.targetMaterialId); this.persist()
     return relation
   }
   listMaterialRelations(materialId: string, limit = 5, includeHidden = false): MaterialRelation[] {
@@ -1047,14 +1165,168 @@ export class WorkspaceService {
   }
   hasConnection(sourceMaterialId: string, targetMaterialId: string): boolean { return this.query('SELECT id FROM relations WHERE source_material_id=? AND target_material_id=? LIMIT 1', [sourceMaterialId, targetMaterialId]).length > 0 }
   hasRelation(sourceMaterialId: string, targetMaterialId: string, label: string): boolean { return this.query('SELECT id FROM relations WHERE source_material_id=? AND target_material_id=? AND label=? LIMIT 1', [sourceMaterialId, targetMaterialId, label]).length > 0 }
-  updateRelation(id: string, label: string): void { this.run('UPDATE relations SET label=? WHERE id=?', [label, id]) }
-  deleteRelation(id: string): void { this.run('DELETE FROM relations WHERE id=?', [id]) }
+  updateRelation(id: string, label: string): void {
+    const relation = this.query('SELECT source_material_id, target_material_id FROM relations WHERE id=?', [id])[0]
+    this.run('UPDATE relations SET label=? WHERE id=?', [label, id])
+    if (relation) { this.bumpTopicsForRelation(String(relation.source_material_id), String(relation.target_material_id)); this.persist() }
+  }
+  deleteRelation(id: string): void {
+    const relation = this.query('SELECT source_material_id, target_material_id FROM relations WHERE id=?', [id])[0]
+    this.run('DELETE FROM relations WHERE id=?', [id])
+    if (relation) { this.bumpTopicsForRelation(String(relation.source_material_id), String(relation.target_material_id)); this.persist() }
+  }
   topicMap(topicId: string): TopicMap {
-    const topic = first<Topic>(this.query('SELECT * FROM topics WHERE id=?', [topicId])); if (!topic) throw new Error('Topic not found')
+    const topicRow = first<SqlRow>(this.query('SELECT * FROM topics WHERE id=?', [topicId])); if (!topicRow) throw new Error('Topic not found')
+    const topic = asTopic(topicRow)
     const materials = this.query('SELECT m.*, mis.availability AS availability, mis.last_indexed_at AS lastIndexedAt, tm.workstream_id AS workstreamId, tm.canvas_x AS canvasX, tm.canvas_y AS canvasY, tm.position_source AS positionSource, tm.card_color AS cardColor, tm.card_tags AS cardTags, tm.card_note AS cardNote, tm.sequence AS sequence, tm.sequence_source AS sequenceSource, tm.added_at AS addedAt, tm.display_title AS displayTitle, tm.display_excerpt AS displayExcerpt, tm.card_width AS cardWidth, tm.card_height AS cardHeight, tm.card_text_color AS cardTextColor, tm.card_font_size AS cardFontSize, tm.card_collapsed AS cardCollapsed, tm.card_z_index AS cardZIndex FROM materials m JOIN topic_materials tm ON tm.material_id=m.id LEFT JOIN material_index_state mis ON mis.material_id=m.id WHERE tm.topic_id=? ORDER BY m.occurred_at', [topicId]).map((row) => { let cardTags: string[] = []; try { const value = JSON.parse(String(row.cardTags ?? '[]')); if (Array.isArray(value)) cardTags = value.filter((tag): tag is string => typeof tag === 'string') } catch { /* Old or invalid rows use empty tags. */ } const material = asMaterial(row); return { ...material, workstreamId: row.workstreamId as string | null, canvasX: row.canvasX as number | null, canvasY: row.canvasY as number | null, positionSource: row.positionSource === 'manual' ? 'manual' as const : 'auto' as const, cardColor: row.cardColor as string | null, cardTags, tags: this.listMaterialTags(material.id), cardNote: row.cardNote as string | null, sequence: row.sequence as number | null, sequenceSource: String(row.sequenceSource ?? 'time'), addedAt: row.addedAt as string | null, displayTitle: row.displayTitle as string | null, displayExcerpt: row.displayExcerpt as string | null, cardWidth: row.cardWidth === null ? null : Number(row.cardWidth), cardHeight: row.cardHeight === null ? null : Number(row.cardHeight), cardTextColor: row.cardTextColor as string | null, cardFontSize: row.cardFontSize === null ? null : Number(row.cardFontSize), cardCollapsed: Boolean(row.cardCollapsed), cardZIndex: Number(row.cardZIndex ?? 0) } })
     const ids = materials.map((m) => m.id); const placeholders = ids.map(() => '?').join(',') || "''"
     const candidates = this.listTopicCandidates(topicId)
     return { topic, materials, workstreams: this.query('SELECT * FROM workstreams WHERE topic_id=? ORDER BY position', [topicId]).map(asWorkstream), relations: this.query(`SELECT r.*, trs.line_color AS lineColor, trs.source_arrow AS sourceArrow, trs.source_arrow_style AS sourceArrowStyle, trs.target_arrow_style AS targetArrowStyle, trs.animated AS animated, trs.archived AS archived, trs.branch_index AS branchIndex, trs.line_kind AS lineKind, trs.source_handle AS sourceHandle, trs.target_handle AS targetHandle, trs.line_width AS lineWidth, trs.line_dash AS lineDash, trs.route_points AS routePoints, trs.label_anchor AS labelAnchor FROM relations r LEFT JOIN topic_relation_styles trs ON trs.relation_id=r.id AND trs.topic_id=? WHERE r.source_material_id IN (${placeholders}) AND r.target_material_id IN (${placeholders}) AND (r.topic_id IS NULL OR r.topic_id=?)`, [topicId, ...ids, ...ids, topicId]).map(asRelation), candidates, history: this.topicHistoryStatus(topicId) }
+  }
+  private topicWikiChecks(topicId: string, content: TopicWikiContent | null): string[] {
+    if (!content) return []
+    const map = this.topicMap(topicId)
+    const materialIds = new Set(map.materials.map((material) => material.id))
+    const chunkIds = new Set(map.materials.flatMap((material) => this.listMaterialChunks(material.id).map((chunk) => chunk.id)))
+    const checks = new Set<string>()
+    const inspectEvidence = (evidence: TopicWikiEvidence[]): void => {
+      if (!evidence.length) checks.add('missing-evidence')
+      for (const item of evidence) {
+        if (!materialIds.has(item.materialId)) checks.add('missing-material')
+        if (item.chunkId && !chunkIds.has(item.chunkId)) checks.add('missing-chunk')
+      }
+    }
+    for (const item of [...content.keyPoints, ...content.openQuestions]) inspectEvidence(item.evidence)
+    for (const relation of content.relations) {
+      if (!materialIds.has(relation.sourceMaterialId) || !materialIds.has(relation.targetMaterialId)) checks.add('missing-material')
+      if (relation.sourceMaterialId === relation.targetMaterialId) checks.add('invalid-relation')
+      inspectEvidence(relation.evidence)
+    }
+    if (!content.summary.trim()) checks.add('invalid-content')
+    return [...checks]
+  }
+  private wikiStatus(topicId: string, content: TopicWikiContent | null, sourceRevision: number | null, draft: TopicWikiDraft | null): TopicWikiPage['status'] {
+    const revision = this.topicRevision(topicId)
+    const draftChecks = draft ? this.topicWikiChecks(topicId, draft.content) : []
+    if (draft) return draft.baseRevision !== revision ? 'needs-update' : draftChecks.length ? 'needs-review' : 'draft'
+    if (!content) return 'empty'
+    const checks = this.topicWikiChecks(topicId, content)
+    if (sourceRevision !== revision) return 'needs-update'
+    return checks.length ? 'needs-review' : 'current'
+  }
+  private topicWikiRun(row: SqlRow): TopicWikiRun {
+    let warnings: string[] = []
+    try { const parsed = JSON.parse(String(row.warnings_json ?? '[]')); if (Array.isArray(parsed)) warnings = parsed.filter((item): item is string => typeof item === 'string').slice(0, 24) } catch { /* Invalid historical warning payloads are ignored. */ }
+    return { id: String(row.id), topicId: String(row.topic_id), baseRevision: Number(row.base_revision), provider: String(row.provider), model: String(row.model), status: row.status as TopicWikiRunStatus, stage: row.stage as TopicWikiRunStage, error: row.error as string | null, warnings, startedAt: String(row.started_at), completedAt: row.completed_at as string | null, updatedAt: String(row.updated_at) }
+  }
+  startTopicWikiRun(topicId: string, baseRevision: number, provider: string, model: string): TopicWikiRun {
+    const run: TopicWikiRun = { id: id(), topicId, baseRevision, provider: provider.slice(0, 80), model: model.slice(0, 160), status: 'running', stage: 'outline', error: null, warnings: [], startedAt: now(), completedAt: null, updatedAt: now() }
+    this.run('INSERT INTO topic_wiki_runs (id, topic_id, base_revision, provider, model, status, stage, error, warnings_json, started_at, completed_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, NULL, ?)', [run.id, run.topicId, run.baseRevision, run.provider, run.model, run.status, run.stage, JSON.stringify(run.warnings), run.startedAt, run.updatedAt])
+    return run
+  }
+  updateTopicWikiRun(runId: string, stage: TopicWikiRunStage, warnings: string[] = []): TopicWikiRun | null {
+    const current = this.query('SELECT * FROM topic_wiki_runs WHERE id=?', [runId])[0]; if (!current) return null
+    let previousWarnings: string[] = []
+    try { const parsed = JSON.parse(String(current.warnings_json ?? '[]')); if (Array.isArray(parsed)) previousWarnings = parsed.filter((item): item is string => typeof item === 'string') } catch { /* Invalid historical warning payloads are replaced. */ }
+    const merged = [...new Set([...previousWarnings, ...warnings.map(String)])].slice(0, 24)
+    this.run('UPDATE topic_wiki_runs SET stage=?, warnings_json=?, updated_at=? WHERE id=?', [stage, JSON.stringify(merged), now(), runId])
+    return this.getTopicWikiRun(runId)
+  }
+  finishTopicWikiRun(runId: string, status: Exclude<TopicWikiRunStatus, 'running' | 'cancelled'> | 'cancelled', error: string | null = null, warnings: string[] = []): TopicWikiRun | null {
+    const current = this.query('SELECT * FROM topic_wiki_runs WHERE id=?', [runId])[0]; if (!current) return null
+    let previousWarnings: string[] = []
+    try { const parsed = JSON.parse(String(current.warnings_json ?? '[]')); if (Array.isArray(parsed)) previousWarnings = parsed.filter((item): item is string => typeof item === 'string') } catch { /* Invalid historical warning payloads are replaced. */ }
+    const merged = [...new Set([...previousWarnings, ...warnings.map(String)])].slice(0, 24); const updatedAt = now()
+    this.run('UPDATE topic_wiki_runs SET status=?, stage=?, error=?, warnings_json=?, completed_at=?, updated_at=? WHERE id=?', [status, status === 'failed' || status === 'cancelled' ? String(current.stage) : 'complete', error ? error.slice(0, 1200) : null, JSON.stringify(merged), updatedAt, updatedAt, runId])
+    return this.getTopicWikiRun(runId)
+  }
+  getTopicWikiRun(runId: string): TopicWikiRun | null { const row = this.query('SELECT * FROM topic_wiki_runs WHERE id=?', [runId])[0]; return row ? this.topicWikiRun(row) : null }
+  listTopicWikiRuns(topicId: string, limit = 12): TopicWikiRun[] { return this.query('SELECT * FROM topic_wiki_runs WHERE topic_id=? ORDER BY started_at DESC LIMIT ?', [topicId, Math.max(1, Math.min(50, limit))]).map((row) => this.topicWikiRun(row)) }
+  listTopicWikiRevisions(topicId: string, limit = 30): TopicWikiRevision[] {
+    return this.query('SELECT * FROM topic_wiki_revisions WHERE topic_id=? ORDER BY version DESC LIMIT ?', [topicId, Math.max(1, Math.min(100, limit))]).flatMap((row) => {
+      try {
+        const content = parseWikiContent(JSON.parse(String(row.content_json))); if (!content) return []
+        return [{ id: String(row.id), topicId: String(row.topic_id), version: Number(row.version), content, sourceRevision: Number(row.source_revision), editSource: row.edit_source as TopicWikiEditSource, provider: row.provider as string | null, model: row.model as string | null, createdAt: String(row.created_at) }]
+      } catch { return [] }
+    })
+  }
+  private snapshotTopicWikiRevision(topicId: string, version: number, content: TopicWikiContent, sourceRevision: number, editSource: TopicWikiEditSource, provider: string | null, model: string | null): void {
+    this.requireDb().run('INSERT OR IGNORE INTO topic_wiki_revisions (id, topic_id, version, content_json, source_revision, edit_source, provider, model, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)', [id(), topicId, version, JSON.stringify(content), sourceRevision, editSource, provider, model, now()])
+  }
+  private trimTopicWikiRevisions(topicId: string): void {
+    this.requireDb().run('DELETE FROM topic_wiki_revisions WHERE id IN (SELECT id FROM topic_wiki_revisions WHERE topic_id=? ORDER BY version DESC LIMIT -1 OFFSET 50)', [topicId])
+  }
+  getTopicWiki(topicId: string): TopicWikiPage {
+    if (!this.query('SELECT id FROM topics WHERE id=?', [topicId])[0]) throw new Error('Topic not found.')
+    const row = this.query('SELECT * FROM topic_wiki_pages WHERE topic_id=?', [topicId])[0]
+    let content: TopicWikiContent | null = null; let draft: TopicWikiDraft | null = null
+    if (row) {
+      try { content = parseWikiContent(JSON.parse(String(row.content_json ?? ''))) } catch { content = null }
+      try {
+        const parsed = JSON.parse(String(row.draft_json ?? '')) as Record<string, unknown>
+        const parsedContent = parseWikiContent(parsed.content)
+        if (parsedContent && Number.isInteger(parsed.baseRevision)) draft = { content: parsedContent, baseRevision: Number(parsed.baseRevision), generatedAt: String(parsed.generatedAt ?? ''), provider: String(parsed.provider ?? ''), model: String(parsed.model ?? ''), checks: this.topicWikiChecks(topicId, parsedContent), runId: typeof parsed.runId === 'string' ? parsed.runId : null, warnings: Array.isArray(parsed.warnings) ? parsed.warnings.filter((item): item is string => typeof item === 'string').slice(0, 24) : [] }
+      } catch { draft = null }
+    }
+    const sourceRevision = row?.source_revision === null || row?.source_revision === undefined ? null : Number(row.source_revision)
+    const editSource = row?.last_edit_source === 'ai' || row?.last_edit_source === 'user' || row?.last_edit_source === 'revert' ? row.last_edit_source as TopicWikiEditSource : null
+    return { topicId, pageType: 'overview', content, sourceRevision, updatedAt: row?.updated_at as string | null ?? null, draft, canUndo: Boolean(Number(row?.undo_available ?? 0)), version: Number(row?.version ?? 0), lastEditSource: editSource, lastProvider: row?.last_provider as string | null ?? null, lastModel: row?.last_model as string | null ?? null, latestRun: this.listTopicWikiRuns(topicId, 1)[0] ?? null, status: this.wikiStatus(topicId, content, sourceRevision, draft), checks: this.topicWikiChecks(topicId, draft?.content ?? content) }
+  }
+  saveTopicWikiDraft(topicId: string, draft: TopicWikiDraft): TopicWikiPage {
+    const revision = this.topicRevision(topicId); if (draft.baseRevision !== revision) throw new Error('The topic changed while the Wiki draft was being generated. Generate it again.')
+    const content = parseWikiContent(draft.content); if (!content) throw new Error('Wiki draft content is invalid.')
+    const checks = this.topicWikiChecks(topicId, content)
+    if (checks.includes('missing-material') || checks.includes('missing-chunk') || checks.includes('invalid-relation')) throw new Error('Wiki draft contains evidence outside the current topic.')
+    const normalized: TopicWikiDraft = { content, baseRevision: revision, generatedAt: draft.generatedAt || now(), provider: draft.provider.slice(0, 80), model: draft.model.slice(0, 160), checks, runId: draft.runId?.slice(0, 120) ?? null, warnings: (draft.warnings ?? []).map(String).slice(0, 24) }
+    this.run('INSERT INTO topic_wiki_pages (topic_id, page_type, draft_json, draft_revision, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(topic_id) DO UPDATE SET page_type=excluded.page_type, draft_json=excluded.draft_json, draft_revision=excluded.draft_revision, updated_at=excluded.updated_at', [topicId, 'overview', JSON.stringify(normalized), revision, now()])
+    return this.getTopicWiki(topicId)
+  }
+  applyTopicWikiDraft(topicId: string): TopicWikiPage {
+    const page = this.getTopicWiki(topicId); if (!page.draft) throw new Error('No Wiki draft is waiting for review.')
+    const revision = this.topicRevision(topicId); if (page.draft.baseRevision !== revision) throw new Error('The Wiki draft is stale. Generate it again.')
+    const checks = this.topicWikiChecks(topicId, page.draft.content); if (checks.length) throw new Error('Review the Wiki evidence before applying this draft.')
+    const row = this.query('SELECT * FROM topic_wiki_pages WHERE topic_id=?', [topicId])[0]
+    this.withTransaction(() => {
+      let currentVersion = Number(row?.version ?? 0)
+      if (page.content) {
+        currentVersion = Math.max(1, currentVersion)
+        this.snapshotTopicWikiRevision(topicId, currentVersion, page.content, page.sourceRevision ?? revision, (row?.last_edit_source as TopicWikiEditSource | undefined) ?? 'ai', row?.last_provider as string | null ?? null, row?.last_model as string | null ?? null)
+      }
+      const nextVersion = currentVersion + 1
+      this.requireDb().run('INSERT INTO topic_wiki_pages (topic_id, page_type, content_json, source_revision, draft_json, draft_revision, previous_content_json, previous_source_revision, undo_available, version, last_edit_source, last_provider, last_model, updated_at) VALUES (?, ?, ?, ?, NULL, NULL, NULL, NULL, 1, ?, ?, ?, ?, ?) ON CONFLICT(topic_id) DO UPDATE SET page_type=excluded.page_type, content_json=excluded.content_json, source_revision=excluded.source_revision, draft_json=NULL, draft_revision=NULL, previous_content_json=topic_wiki_pages.content_json, previous_source_revision=topic_wiki_pages.source_revision, undo_available=1, version=excluded.version, last_edit_source=excluded.last_edit_source, last_provider=excluded.last_provider, last_model=excluded.last_model, updated_at=excluded.updated_at', [topicId, 'overview', JSON.stringify(page.draft!.content), revision, nextVersion, 'ai', page.draft!.provider, page.draft!.model, now()])
+      this.snapshotTopicWikiRevision(topicId, nextVersion, page.draft!.content, revision, 'ai', page.draft!.provider, page.draft!.model)
+      this.trimTopicWikiRevisions(topicId)
+    })
+    return this.getTopicWiki(topicId)
+  }
+  discardTopicWikiDraft(topicId: string): TopicWikiPage {
+    this.run('UPDATE topic_wiki_pages SET draft_json=NULL, draft_revision=NULL, updated_at=? WHERE topic_id=?', [now(), topicId])
+    return this.getTopicWiki(topicId)
+  }
+  revertTopicWikiApply(topicId: string): TopicWikiPage {
+    const row = this.query('SELECT undo_available FROM topic_wiki_pages WHERE topic_id=?', [topicId])[0]
+    if (!row || !Boolean(Number(row.undo_available ?? 0))) throw new Error('No applied Wiki change is available to undo.')
+    const page = this.getTopicWiki(topicId); const previous = this.listTopicWikiRevisions(topicId, 2).find((revision) => revision.version < page.version)
+    if (previous) {
+      this.revertTopicWikiRevision(topicId, previous.version)
+      this.run('UPDATE topic_wiki_pages SET undo_available=0 WHERE topic_id=?', [topicId])
+      return this.getTopicWiki(topicId)
+    }
+    this.withTransaction(() => { this.requireDb().run('UPDATE topic_wiki_pages SET content_json=previous_content_json, source_revision=previous_source_revision, previous_content_json=NULL, previous_source_revision=NULL, undo_available=0, last_edit_source=?, last_provider=NULL, last_model=NULL, updated_at=? WHERE topic_id=?', ['revert', now(), topicId]) })
+    return this.getTopicWiki(topicId)
+  }
+  revertTopicWikiRevision(topicId: string, version: number): TopicWikiPage {
+    const target = this.listTopicWikiRevisions(topicId, 100).find((revision) => revision.version === version)
+    if (!target) throw new Error('Wiki revision not found.')
+    const row = this.query('SELECT * FROM topic_wiki_pages WHERE topic_id=?', [topicId])[0]; if (!row) throw new Error('Wiki page not found.')
+    const current = this.getTopicWiki(topicId); if (current.version === target.version) throw new Error('The selected Wiki revision is already current.')
+    this.withTransaction(() => {
+      const nextVersion = Math.max(Number(row.version ?? 0), target.version) + 1
+      this.requireDb().run('UPDATE topic_wiki_pages SET content_json=?, source_revision=?, draft_json=NULL, draft_revision=NULL, previous_content_json=?, previous_source_revision=?, undo_available=1, version=?, last_edit_source=?, last_provider=NULL, last_model=NULL, updated_at=? WHERE topic_id=?', [JSON.stringify(target.content), target.sourceRevision, current.content ? JSON.stringify(current.content) : null, current.sourceRevision, nextVersion, 'revert', now(), topicId])
+      this.snapshotTopicWikiRevision(topicId, nextVersion, target.content, target.sourceRevision, 'revert', null, null)
+      this.trimTopicWikiRevisions(topicId)
+    })
+    return this.getTopicWiki(topicId)
   }
   getMaterialAnalysisCard(materialId: string, modelId: string): MaterialAnalysisCard | null {
     const material = this.getMaterial(materialId); if (!material) return null
@@ -1125,6 +1397,7 @@ export class WorkspaceService {
     this.requireDb().run('INSERT OR REPLACE INTO material_index_state (material_id, source_id, availability, last_indexed_at, last_seen_at) VALUES (?, COALESCE((SELECT source_id FROM material_index_state WHERE material_id=?), NULL), ?, ?, ?)', [materialId, materialId, 'available', indexedAt, indexedAt])
     const material = this.getMaterial(materialId); const headings = chunks.map((chunk) => chunk.heading).filter((heading): heading is string => Boolean(heading)); this.requireDb().run('DELETE FROM material_tags WHERE material_id=?', [materialId]); for (const tag of extractedTags(material?.title ?? '', text, headings)) this.requireDb().run('INSERT INTO material_tags (material_id, tag, source, weight) VALUES (?, ?, ?, ?)', [materialId, tag.tag, tag.source, tag.weight])
     this.indexMaterialEntities(materialId, text, headings)
+    this.bumpTopicsForMaterial(materialId)
     this.persist()
     this.rebuildMaterialRelations(materialId)
     void this.embedMaterial(materialId)
@@ -1326,15 +1599,31 @@ export class WorkspaceService {
   listMaterialChunks(materialId: string): MaterialChunk[] { return this.query('SELECT * FROM material_chunks WHERE material_id=? ORDER BY ordinal', [materialId]).map((row) => ({ id: String(row.id), materialId: String(row.material_id), ordinal: Number(row.ordinal), text: String(row.text), startOffset: Number(row.start_offset), endOffset: Number(row.end_offset), pageNumber: row.page_number === null ? null : Number(row.page_number), heading: row.heading as string | null, hash: String(row.hash), indexedAt: String(row.indexed_at) })) }
 
   listTopicProposals(topicId: string, status: TopicProposal['status'] = 'pending'): TopicProposal[] {
+    const revision = this.topicRevision(topicId)
     return this.query('SELECT * FROM topic_proposals WHERE topic_id=? AND status=? ORDER BY created_at DESC', [topicId, status]).map((row) => {
       let payload: Record<string, unknown> = {}; try { payload = JSON.parse(String(row.payload ?? '{}')) } catch { /* tolerate malformed legacy payloads */ }
-      return { id: String(row.id), topicId: String(row.topic_id), kind: String(row.kind), reason: String(row.reason), evidence: String(row.evidence), materialId: row.material_id as string | null, relationId: row.relation_id as string | null, payload, status: row.status as TopicProposal['status'], createdAt: String(row.created_at), updatedAt: String(row.updated_at) }
+      const baseRevision = row.base_revision === null || row.base_revision === undefined ? null : Number(row.base_revision)
+      return { id: String(row.id), topicId: String(row.topic_id), kind: String(row.kind), reason: String(row.reason), evidence: String(row.evidence), materialId: row.material_id as string | null, relationId: row.relation_id as string | null, payload, status: row.status as TopicProposal['status'], createdAt: String(row.created_at), updatedAt: String(row.updated_at), runId: row.run_id as string | null, baseRevision, source: (row.source as TopicProposalSource) ?? 'legacy', stale: baseRevision !== null && baseRevision !== revision }
     })
+  }
+
+  createTopicProposalRun(input: Omit<TopicProposalRun, 'createdAt' | 'updatedAt'>): TopicProposalRun {
+    const created = now(); const run = { ...input, createdAt: created, updatedAt: created }
+    this.run('INSERT INTO topic_proposal_runs (id, topic_id, base_revision, instruction, provider, model, summary, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', [run.id, run.topicId, run.baseRevision, run.instruction, run.provider, run.model, run.summary, run.status, run.createdAt, run.updatedAt])
+    return run
+  }
+  topicProposalRun(runId: string): TopicProposalRun | null {
+    const row = first<SqlRow>(this.query('SELECT * FROM topic_proposal_runs WHERE id=?', [runId])); if (!row) return null
+    return { id: String(row.id), topicId: String(row.topic_id), baseRevision: Number(row.base_revision), instruction: String(row.instruction), provider: String(row.provider), model: String(row.model), summary: String(row.summary), status: row.status as TopicProposalRunStatus, createdAt: String(row.created_at), updatedAt: String(row.updated_at) }
+  }
+  updateTopicProposalRun(runId: string, status: TopicProposalRunStatus, summary?: string): TopicProposalRun | null {
+    this.run('UPDATE topic_proposal_runs SET status=?, summary=COALESCE(?, summary), updated_at=? WHERE id=?', [status, summary ?? null, now(), runId])
+    return this.topicProposalRun(runId)
   }
 
   createTopicProposals(topicId: string, proposals: Array<Omit<TopicProposal, 'id' | 'topicId' | 'status' | 'createdAt' | 'updatedAt'>>): TopicProposal[] {
     const created = now()
-    for (const proposal of proposals) this.run('INSERT INTO topic_proposals (id, topic_id, kind, reason, evidence, material_id, relation_id, payload, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', [id(), topicId, proposal.kind, proposal.reason, proposal.evidence, proposal.materialId ?? null, proposal.relationId ?? null, JSON.stringify(proposal.payload ?? {}), 'pending', created, created])
+    for (const proposal of proposals) this.run('INSERT INTO topic_proposals (id, topic_id, kind, reason, evidence, material_id, relation_id, payload, status, created_at, updated_at, run_id, base_revision, source) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)', [id(), topicId, proposal.kind, proposal.reason, proposal.evidence, proposal.materialId ?? null, proposal.relationId ?? null, JSON.stringify(proposal.payload ?? {}), 'pending', created, created, proposal.runId ?? null, proposal.baseRevision ?? null, proposal.source ?? 'legacy'])
     return this.listTopicProposals(topicId)
   }
 
@@ -1344,32 +1633,49 @@ export class WorkspaceService {
     return this.listTopicProposals(String(row.topic_id), status).find((proposal) => proposal.id === proposalId) ?? null
   }
 
+  private proposalCommand(proposal: TopicProposal): TopicEditorCommand {
+    const payload = proposal.payload
+    if (proposal.kind === 'create_relation') return { kind: 'createRelation', payload: { relation: { sourceMaterialId: payload.sourceMaterialId, targetMaterialId: payload.targetMaterialId, label: payload.label, relationType: payload.relationType ?? 'related', confidence: payload.confidence ?? null, evidenceMaterialId: null } } }
+    if (proposal.kind === 'rename_relation') return { kind: 'renameRelation', payload: { relationId: proposal.relationId ?? payload.relationId, label: payload.label } }
+    if (proposal.kind === 'set_sequence') return { kind: 'setSequence', payload: { materialId: proposal.materialId ?? payload.materialId, sequence: payload.sequence } }
+    if (proposal.kind === 'set_card_style') { const materialId = proposal.materialId ?? payload.materialId; const { materialId: _materialId, ...patch } = payload; return { kind: 'patchCard', payload: { materialId, patch } } }
+    if (proposal.kind === 'layout') return { kind: 'moveCards', payload: { positions: payload.positions } }
+    if (proposal.kind === 'create_workstream') return { kind: 'createWorkstream', payload: { name: payload.name, materialIds: payload.materialIds } }
+    throw new Error('This proposal type is not supported by the board editor yet.')
+  }
+  private ensureProposalCurrent(topicId: string, proposal: TopicProposal): void {
+    if (proposal.baseRevision !== null && proposal.baseRevision !== undefined && proposal.baseRevision !== this.topicRevision(topicId)) throw new Error('This proposal is stale because the topic changed. Generate it again before applying.')
+  }
+  private refreshProposalRunStatus(runId: string): void {
+    const pending = Number(this.query("SELECT COUNT(*) AS count FROM topic_proposals WHERE run_id=? AND status='pending'", [runId])[0]?.count ?? 0)
+    this.updateTopicProposalRun(runId, pending ? 'partial' : 'applied')
+  }
   acceptTopicProposal(topicId: string, proposalId: string): TopicProposal {
     return this.withTransaction(() => {
       const proposal = this.listTopicProposals(topicId).find((item) => item.id === proposalId)
       if (!proposal) throw new Error('Pending proposal not found.')
-      const payload = proposal.payload
-      let command: TopicEditorCommand
-      if (proposal.kind === 'create_relation') {
-        command = { kind: 'createRelation', payload: { relation: { sourceMaterialId: payload.sourceMaterialId, targetMaterialId: payload.targetMaterialId, label: payload.label, relationType: payload.relationType ?? 'related', confidence: payload.confidence ?? null, evidenceMaterialId: null } } }
-      } else if (proposal.kind === 'rename_relation') {
-        command = { kind: 'renameRelation', payload: { relationId: proposal.relationId ?? payload.relationId, label: payload.label } }
-      } else if (proposal.kind === 'set_sequence') {
-        command = { kind: 'setSequence', payload: { materialId: proposal.materialId ?? payload.materialId, sequence: payload.sequence } }
-      } else if (proposal.kind === 'set_card_style') {
-        const materialId = proposal.materialId ?? payload.materialId
-        const { materialId: _materialId, ...patch } = payload
-        command = { kind: 'patchCard', payload: { materialId, patch } }
-      } else if (proposal.kind === 'layout') {
-        command = { kind: 'moveCards', payload: { positions: payload.positions } }
-      } else if (proposal.kind === 'create_workstream') {
-        command = { kind: 'createWorkstream', payload: { name: payload.name, materialIds: payload.materialIds } }
-      } else {
-        throw new Error('This proposal type is not supported by the board editor yet.')
-      }
-      this.executeTopicEditorCommand(topicId, command)
+      this.ensureProposalCurrent(topicId, proposal)
+      this.executeTopicEditorCommand(topicId, this.proposalCommand(proposal))
       const accepted = this.updateTopicProposalStatus(proposalId, 'accepted')
       if (!accepted) throw new Error('Proposal could not be accepted.')
+      if (proposal.runId) this.refreshProposalRunStatus(proposal.runId)
+      return accepted
+    })
+  }
+  acceptTopicProposals(topicId: string, proposalIds: string[]): TopicProposal[] {
+    const ids = [...new Set(proposalIds)]
+    if (!ids.length || ids.length > 64) throw new Error('Proposal list is invalid.')
+    return this.withTransaction(() => {
+      const proposals = ids.map((proposalId) => {
+        const proposal = this.listTopicProposals(topicId).find((item) => item.id === proposalId)
+        if (!proposal) throw new Error('Pending proposal not found.')
+        this.ensureProposalCurrent(topicId, proposal)
+        return proposal
+      })
+      this.executeTopicEditorCommands(topicId, proposals.map((proposal) => this.proposalCommand(proposal)))
+      const accepted = proposals.map((proposal) => this.updateTopicProposalStatus(proposal.id, 'accepted')).filter((proposal): proposal is TopicProposal => Boolean(proposal))
+      for (const runId of [...new Set(proposals.map((proposal) => proposal.runId).filter((value): value is string => Boolean(value)))]) this.refreshProposalRunStatus(runId)
+      if (accepted.length !== proposals.length) throw new Error('Some proposals could not be accepted.')
       return accepted
     })
   }
@@ -1380,6 +1686,21 @@ export class WorkspaceService {
     const archived = this.updateTopicProposalStatus(proposalId, 'archived')
     if (!archived) throw new Error('Proposal could not be archived.')
     return archived
+  }
+  archiveTopicProposals(topicId: string, proposalIds: string[]): TopicProposal[] {
+    const ids = [...new Set(proposalIds)]
+    if (!ids.length || ids.length > 64) throw new Error('Proposal list is invalid.')
+    return this.withTransaction(() => {
+      const proposals = ids.map((proposalId) => {
+        const proposal = this.listTopicProposals(topicId).find((item) => item.id === proposalId)
+        if (!proposal) throw new Error('Pending proposal not found.')
+        return proposal
+      })
+      const archived = proposals.map((proposal) => this.updateTopicProposalStatus(proposal.id, 'archived')).filter((proposal): proposal is TopicProposal => Boolean(proposal))
+      if (archived.length !== proposals.length) throw new Error('Some proposals could not be archived.')
+      for (const runId of [...new Set(proposals.map((proposal) => proposal.runId).filter((value): value is string => Boolean(value)))]) this.refreshProposalRunStatus(runId)
+      return archived
+    })
   }
 
   searchKnowledge(query: string, options: { limit?: number; sourceId?: string } = {}): SearchHit[] {
@@ -1407,7 +1728,35 @@ export class WorkspaceService {
   search(query: string): Material[] { return this.query('SELECT m.*, mis.availability AS availability, mis.last_indexed_at AS lastIndexedAt FROM materials m LEFT JOIN material_index_state mis ON mis.material_id=m.id WHERE m.title LIKE ? OR m.extracted_text LIKE ? OR m.excerpt LIKE ? ORDER BY m.imported_at DESC', [`%${query}%`, `%${query}%`, `%${query}%`]).map(asMaterial) }
   getSettings(): ModelSettings { const settings = first<{ value: string }>(this.query('SELECT value FROM settings WHERE key=?', ['model'])); return settings ? JSON.parse(settings.value) : { profileId: null, provider: 'ollama', baseUrl: 'http://localhost:11434', chatModel: '', embeddingModel: '', allowCloud: false, enabled: false } }
   saveSettings(settings: ModelSettings): void { this.run('INSERT OR REPLACE INTO settings VALUES (?, ?)', ['model', JSON.stringify(settings)]) }
-  async exportPackage(destination: string): Promise<void> { await new Promise<void>((resolve, reject) => { const stream = createWriteStream(destination); const archive = new ZipArchive({ zlib: { level: 8 } }); stream.on('close', resolve); stream.on('error', reject); archive.on('error', reject); archive.pipe(stream); archive.directory(this.root, false); void archive.finalize() }) }
+  private packageManifest(): { schemaVersion: number; workspaceId: string; generatedAt: string; files: Array<{ path: string; size: number; sha256: string }>; counts: { materials: number; relations: number; topics: number; proposals: number; history: number } } {
+    const files = ['workspace.json', this.config?.encrypted ? 'workspace.sqlite.enc' : 'workspace.sqlite', 'vectors.sqlite'].flatMap((relativePath) => {
+      const filePath = join(this.root, relativePath)
+      if (!existsSync(filePath)) return []
+      const content = readFileSync(filePath)
+      return [{ path: relativePath, size: content.byteLength, sha256: createHash('sha256').update(content).digest('hex') }]
+    })
+    const count = (table: string): number => Number((first<SqlRow>(this.query(`SELECT COUNT(*) AS count FROM ${table}`))?.count ?? 0))
+    return { schemaVersion: 2, workspaceId: this.config?.id ?? '', generatedAt: now(), files, counts: { materials: count('materials'), relations: count('relations'), topics: count('topics'), proposals: count('topic_proposals'), history: count('topic_editor_history') } }
+  }
+  private verifyPackageManifest(root: string): void {
+    const manifestPath = join(root, 'workspace-manifest.json')
+    if (!existsSync(manifestPath)) return
+    const manifest = JSON.parse(readFileSync(manifestPath, 'utf8')) as { schemaVersion?: number; files?: Array<{ path?: string; size?: number; sha256?: string }> }
+    if (manifest.schemaVersion !== undefined && (!Number.isInteger(manifest.schemaVersion) || manifest.schemaVersion > 2)) throw new Error('Workspace package schema is newer than this application.')
+    for (const entry of manifest.files ?? []) {
+      if (typeof entry.path !== 'string' || !entry.path || entry.path.includes('..') || typeof entry.sha256 !== 'string') throw new Error('Workspace package manifest is invalid.')
+      const filePath = join(root, entry.path)
+      if (!existsSync(filePath)) throw new Error(`Workspace package is incomplete: ${entry.path}`)
+      const content = readFileSync(filePath)
+      if (entry.size !== undefined && content.byteLength !== entry.size) throw new Error(`Workspace package checksum size mismatch: ${entry.path}`)
+      if (createHash('sha256').update(content).digest('hex') !== entry.sha256) throw new Error(`Workspace package checksum mismatch: ${entry.path}`)
+    }
+  }
+  async exportPackage(destination: string): Promise<void> {
+    const manifest = this.packageManifest()
+    writeFileSync(join(this.root, 'workspace-manifest.json'), JSON.stringify(manifest, null, 2))
+    await new Promise<void>((resolve, reject) => { const stream = createWriteStream(destination); const archive = new ZipArchive({ zlib: { level: 8 } }); stream.on('close', resolve); stream.on('error', reject); archive.on('error', reject); archive.pipe(stream); archive.directory(this.root, false, (entry) => basename(entry.name).startsWith('.workspace-') ? false : entry); void archive.finalize() })
+  }
   async inspectPackage(packagePath: string): Promise<{ name: string; encrypted: boolean }> {
     const archive = await unzipper.Open.file(packagePath)
     const config = archive.files.find((file) => file.path === 'workspace.json')
@@ -1415,5 +1764,5 @@ export class WorkspaceService {
     const parsed = JSON.parse((await config.buffer()).toString('utf8')) as WorkspaceConfig
     return { name: String(parsed.name ?? '未命名工作区'), encrypted: Boolean(parsed.encrypted) }
   }
-  async importPackage(packagePath: string, destination: string, password?: string): Promise<WorkspaceSummary> { mkdirSync(destination, { recursive: true }); await (await unzipper.Open.file(packagePath)).extract({ path: destination }); return this.open(destination, password) }
+  async importPackage(packagePath: string, destination: string, password?: string): Promise<WorkspaceSummary> { mkdirSync(destination, { recursive: true }); await (await unzipper.Open.file(packagePath)).extract({ path: destination }); this.verifyPackageManifest(destination); return this.open(destination, password) }
 }

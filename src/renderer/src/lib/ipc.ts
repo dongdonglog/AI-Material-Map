@@ -12,8 +12,12 @@ export const ipc = {
     history: (topicId: string) => window.materialMap.topics.history(topicId),
     proposals: (topicId: string) => window.materialMap.topics.proposals(topicId),
     acceptProposal: (topicId: string, proposalId: string) => window.materialMap.topics.acceptProposal(topicId, proposalId),
+    acceptProposals: (topicId: string, proposalIds: string[]) => window.materialMap.topics.acceptProposals(topicId, proposalIds),
     archiveProposal: (topicId: string, proposalId: string) => window.materialMap.topics.archiveProposal(topicId, proposalId),
+    archiveProposals: (topicId: string, proposalIds: string[]) => window.materialMap.topics.archiveProposals(topicId, proposalIds),
     rebuildTopology: (topicId: string) => window.materialMap.topics.rebuildTopology(topicId),
+    updateView: (topicId: string, input: { viewMode?: 'map' | 'flow'; confirmedOnly?: boolean; focusedWorkstreamId?: string | null }) => window.materialMap.topics.updateView(topicId, input),
+    planCanvas: (input: import('../types').CanvasAiRequest) => window.materialMap.planCanvas(input),
     cardStyle: (topicId: string, materialId: string, input: { color?: string; tags?: string[]; note?: string }) => window.materialMap.topics.updateCardStyle(topicId, materialId, input),
     relationStyle: (topicId: string, relationId: string, input: Parameters<typeof window.materialMap.topics.updateRelationStyle>[2]) => window.materialMap.topics.updateRelationStyle(topicId, relationId, input)
   },
@@ -31,6 +35,7 @@ export const ipc = {
   },
   workstream: {
     create: (topicId: string, name: string) => window.materialMap.workstreams.create(topicId, name),
+    presentation: (id: string, input: { color?: string; collapsed?: boolean }) => window.materialMap.workstreams.updatePresentation(id, input),
     move: (topicId: string, materialId: string, workstreamId: string | null) => window.materialMap.workstreams.moveMaterial(topicId, materialId, workstreamId)
   }
 }

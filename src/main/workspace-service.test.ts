@@ -483,6 +483,7 @@ describe('WorkspaceService', () => {
     await imported.importPackage(packagePath, destination)
     expect(imported.summary()).toMatchObject({ root: destination, name: 'Research' })
     expect(imported.search('survives')).toHaveLength(1)
+    expect(existsSync(join(destination, 'workspace-manifest.json'))).toBe(true)
   })
 
   it('archives a topic without deleting its materials, styles, or positions', async () => {
@@ -692,12 +693,171 @@ describe('WorkspaceService', () => {
     expect(service.topicMap(topic.id).materials.every((material) => !material.workstreamId)).toBe(true)
   })
 
+  it('applies current proposals atomically as one undoable history entry', async () => {
+    const service = makeService(); await service.create(makeRoot(), 'Knowledge')
+    const first = await service.createNote('First', 'Local first'); const second = await service.createNote('Second', 'Local second')
+    const topic = service.createTopic('Review'); service.addMaterialsToTopic(topic.id, [first.id, second.id])
+    const baseRevision = service.topicMap(topic.id).topic.revision
+    const proposals = service.createTopicProposals(topic.id, [
+      { kind: 'create_relation', reason: 'The order is explicit.', evidence: 'First then second.', materialId: null, relationId: null, payload: { sourceMaterialId: first.id, targetMaterialId: second.id, relationType: 'next', label: 'next' }, baseRevision, source: 'canvas-ai' },
+      { kind: 'create_workstream', reason: 'Both belong to one lane.', evidence: 'Same workflow.', materialId: null, relationId: null, payload: { name: 'Workflow', materialIds: [first.id, second.id] }, baseRevision, source: 'canvas-ai' }
+    ])
+    const before = service.topicHistoryStatus(topic.id).cursor
+    expect(service.acceptTopicProposals(topic.id, proposals.map((proposal) => proposal.id))).toHaveLength(2)
+    expect(service.topicHistoryStatus(topic.id).cursor).toBe(before + 1)
+    expect(service.topicMap(topic.id).relations).toHaveLength(1)
+    expect(service.topicMap(topic.id).workstreams).toHaveLength(1)
+    service.undoTopicEditorCommand(topic.id)
+    expect(service.topicMap(topic.id).relations).toHaveLength(0)
+    expect(service.topicMap(topic.id).workstreams).toHaveLength(0)
+  })
+
+  it('marks a proposal stale when the topic revision changes before review', async () => {
+    const service = makeService(); await service.create(makeRoot(), 'Knowledge')
+    const first = await service.createNote('First', 'Local first'); const second = await service.createNote('Second', 'Local second')
+    const topic = service.createTopic('Review'); service.addMaterialsToTopic(topic.id, [first.id, second.id])
+    const baseRevision = service.topicMap(topic.id).topic.revision
+    const proposal = service.createTopicProposals(topic.id, [{ kind: 'create_relation', reason: 'Reason', evidence: 'Evidence', materialId: null, relationId: null, payload: { sourceMaterialId: first.id, targetMaterialId: second.id, relationType: 'next', label: 'next' }, baseRevision, source: 'canvas-ai' }])[0]
+    service.positionMaterial(topic.id, first.id, 80, 90)
+    expect(service.listTopicProposals(topic.id)[0].stale).toBe(true)
+    expect(() => service.acceptTopicProposal(topic.id, proposal.id)).toThrow('stale')
+    expect(service.topicMap(topic.id).relations).toHaveLength(0)
+  })
+
+  it('keeps a current proposal reviewable after reopening an unchanged workspace', async () => {
+    const root = join(makeRoot(), 'workspace')
+    const service = makeService(); await service.create(root, 'Knowledge')
+    const first = await service.createNote('First', 'The first review step.'); const second = await service.createNote('Second', 'The second review step.')
+    const topic = service.createTopic('Review'); service.addMaterialsToTopic(topic.id, [first.id, second.id])
+    const baseRevision = service.topicMap(topic.id).topic.revision
+    const proposal = service.createTopicProposals(topic.id, [{ kind: 'create_relation', reason: 'The steps are consecutive.', evidence: 'First, then second.', materialId: null, relationId: null, payload: { sourceMaterialId: first.id, targetMaterialId: second.id, relationType: 'next', label: 'next' }, baseRevision, source: 'canvas-ai' }])[0]
+
+    const reopened = makeService(); await reopened.open(root)
+    expect(reopened.topicMap(topic.id).topic.revision).toBe(baseRevision)
+    expect(reopened.listTopicProposals(topic.id)).toEqual([expect.objectContaining({ id: proposal.id, stale: false })])
+  })
+
+  it('persists map view preferences with legacy-safe defaults', async () => {
+    const service = makeService(); await service.create(makeRoot(), 'Knowledge')
+    const topic = service.createTopic('Review')
+    expect(topic.viewMode).toBe('map')
+    expect(topic.confirmedOnly).toBe(false)
+    const updated = service.updateTopicViewPreferences(topic.id, { viewMode: 'flow', confirmedOnly: true })
+    expect(updated).toMatchObject({ viewMode: 'flow', confirmedOnly: true })
+  })
+
+  it('persists workstream presentation and focus preferences after reopening', async () => {
+    const root = join(makeRoot(), 'workspace')
+    const service = makeService(); await service.create(root, 'Knowledge')
+    const note = await service.createNote('Research', 'Keep this workstream visible in the canvas.')
+    const topic = service.createTopic('Review')
+    const workstream = service.createWorkstream(topic.id, 'Research lane')
+    service.addToTopic(topic.id, note.id, workstream.id)
+    expect(service.updateWorkstreamPresentation(workstream.id, { color: '#3568B8', collapsed: true })).toMatchObject({ color: '#3568b8', collapsed: true })
+    service.updateTopicViewPreferences(topic.id, { focusedWorkstreamId: workstream.id })
+
+    const reopened = makeService(); await reopened.open(root)
+    expect(reopened.topicMap(topic.id)).toMatchObject({
+      topic: { focusedWorkstreamId: workstream.id },
+      workstreams: [expect.objectContaining({ id: workstream.id, color: '#3568b8', collapsed: true })]
+    })
+  })
+
+  it('archives proposal batches atomically', async () => {
+    const service = makeService(); await service.create(makeRoot(), 'Knowledge')
+    const topic = service.createTopic('Review')
+    const proposals = service.createTopicProposals(topic.id, [
+      { kind: 'layout', reason: 'Keep the flow readable.', evidence: 'The materials form a sequence.', materialId: null, relationId: null, payload: { positions: [] } },
+      { kind: 'create_workstream', reason: 'These items belong together.', evidence: 'They share the same task.', materialId: null, relationId: null, payload: { name: 'Draft', materialIds: [] } }
+    ])
+
+    expect(() => service.archiveTopicProposals(topic.id, [proposals[0].id, 'missing-proposal'])).toThrow('Pending proposal not found.')
+    expect(service.listTopicProposals(topic.id).map((proposal) => proposal.id)).toEqual(proposals.map((proposal) => proposal.id))
+    expect(service.archiveTopicProposals(topic.id, proposals.map((proposal) => proposal.id)).map((proposal) => proposal.status)).toEqual(['archived', 'archived'])
+    expect(service.listTopicProposals(topic.id)).toHaveLength(0)
+  })
+
   it('requeues materials left running when a workspace is reopened', async () => {
     const root = join(makeRoot(), 'workspace'); const service = makeService(); await service.create(root, 'Recovery')
     const note = await service.createNote('README', 'Local recovery test')
     service.startJob(note.id, 'extract')
     const reopened = makeService(); await reopened.open(root)
     await vi.waitFor(() => expect(reopened.listJobs().some((job) => job.materialId === note.id && job.status === 'complete')).toBe(true))
+  })
+
+  it('stores a reviewable topic Wiki draft, applies it, and marks it stale after topic relationships change', async () => {
+    const service = makeService(); await service.create(makeRoot(), 'Wiki')
+    const first = await service.createNote('First', 'The first step is documented.')
+    const second = await service.createNote('Second', 'The second step follows the first.')
+    const topic = service.createTopic('Workflow'); service.addMaterialsToTopic(topic.id, [first.id, second.id])
+    const chunk = service.listMaterialChunks(first.id)[0]
+    const evidence = { materialId: first.id, chunkId: chunk.id, title: first.title, excerpt: chunk.text, heading: chunk.heading }
+    const content = { summary: 'A documented workflow.', keyPoints: [{ text: 'The first step is documented.', evidence: [evidence] }], relations: [], openQuestions: [] }
+    const baseRevision = service.topicMap(topic.id).topic.revision
+    expect(service.getTopicWiki(topic.id)).toMatchObject({ status: 'empty', content: null, draft: null })
+    expect(service.saveTopicWikiDraft(topic.id, { content, baseRevision, generatedAt: 'now', provider: 'ollama', model: 'test', checks: [] })).toMatchObject({ status: 'draft', draft: { baseRevision } })
+    expect(service.applyTopicWikiDraft(topic.id)).toMatchObject({ status: 'current', content: { summary: 'A documented workflow.' }, draft: null, sourceRevision: baseRevision })
+    service.createRelation({ sourceMaterialId: first.id, targetMaterialId: second.id, label: 'follows', relationType: 'related', evidenceText: null, evidenceMaterialId: null, confidence: null, createdBy: 'manual' })
+    expect(service.getTopicWiki(topic.id).status).toBe('needs-update')
+  })
+
+  it('flags Wiki conclusions without evidence and rejects evidence outside the topic', async () => {
+    const service = makeService(); await service.create(makeRoot(), 'Wiki')
+    const material = await service.createNote('Known', 'A local fact.')
+    const other = await service.createNote('Other', 'Another local fact.')
+    const topic = service.createTopic('Evidence'); service.addToTopic(topic.id, material.id)
+    const revision = service.topicMap(topic.id).topic.revision
+    const missingEvidence = { summary: 'A fact.', keyPoints: [{ text: 'Unsupported claim.', evidence: [] }], relations: [], openQuestions: [] }
+    expect(service.saveTopicWikiDraft(topic.id, { content: missingEvidence, baseRevision: revision, generatedAt: '', provider: 'local', model: 'test', checks: [] })).toMatchObject({ status: 'needs-review', checks: ['missing-evidence'] })
+    expect(() => service.applyTopicWikiDraft(topic.id)).toThrow('evidence')
+    const outside = { summary: 'A fact.', keyPoints: [{ text: 'Claim.', evidence: [{ materialId: other.id, chunkId: null, title: other.title, excerpt: 'outside', heading: null }] }], relations: [], openQuestions: [] }
+    expect(() => service.saveTopicWikiDraft(topic.id, { content: outside, baseRevision: revision, generatedAt: '', provider: 'local', model: 'test', checks: [] })).toThrow('outside')
+  })
+
+  it('marks an applied Wiki as needing an update when a topic document changes', async () => {
+    const service = makeService(); await service.create(makeRoot(), 'Wiki source revision')
+    const material = await service.createDocument('Source', 'Original source.', 'md')
+    const topic = service.createTopic('Evidence'); service.addToTopic(topic.id, material.id)
+    const chunk = service.listMaterialChunks(material.id)[0]
+    const content = { summary: 'Original source.', keyPoints: [{ text: 'The source is original.', evidence: [{ materialId: material.id, chunkId: chunk.id, title: material.title, excerpt: chunk.text, heading: chunk.heading }] }], relations: [], openQuestions: [] }
+    const revision = service.topicMap(topic.id).topic.revision
+    service.saveTopicWikiDraft(topic.id, { content, baseRevision: revision, generatedAt: '', provider: 'local', model: 'test', checks: [] })
+    service.applyTopicWikiDraft(topic.id)
+
+    await service.saveTextMaterial(material.id, material.title, 'Updated source.')
+
+    expect(service.getTopicWiki(topic.id)).toMatchObject({ status: 'needs-update', checks: ['missing-chunk'] })
+  })
+
+  it('restores the previous formal Wiki page when an applied change is undone', async () => {
+    const service = makeService(); await service.create(makeRoot(), 'Wiki undo')
+    const topic = service.createTopic('Overview')
+    const revision = service.topicMap(topic.id).topic.revision
+    const first = { summary: 'First formal version.', keyPoints: [], relations: [], openQuestions: [] }
+    const second = { summary: 'Second formal version.', keyPoints: [], relations: [], openQuestions: [] }
+    service.saveTopicWikiDraft(topic.id, { content: first, baseRevision: revision, generatedAt: '', provider: 'local', model: 'test', checks: [] })
+    service.applyTopicWikiDraft(topic.id)
+    service.saveTopicWikiDraft(topic.id, { content: second, baseRevision: revision, generatedAt: '', provider: 'local', model: 'test', checks: [] })
+    expect(service.applyTopicWikiDraft(topic.id)).toMatchObject({ content: { summary: 'Second formal version.' }, canUndo: true })
+    expect(service.revertTopicWikiApply(topic.id)).toMatchObject({ content: { summary: 'First formal version.' }, canUndo: false, status: 'current' })
+  })
+
+  it('persists Wiki generation runs and immutable formal revisions', async () => {
+    const service = makeService(); await service.create(makeRoot(), 'Wiki history')
+    const topic = service.createTopic('Overview')
+    const revision = service.topicMap(topic.id).topic.revision
+    const run = service.startTopicWikiRun(topic.id, revision, 'compatible', 'test-model')
+    expect(service.updateTopicWikiRun(run.id, 'summary', ['outline-fallback'])).toMatchObject({ status: 'running', stage: 'summary', warnings: ['outline-fallback'] })
+    expect(service.finishTopicWikiRun(run.id, 'partial', null, ['summary-fallback'])).toMatchObject({ status: 'partial', stage: 'complete', warnings: ['outline-fallback', 'summary-fallback'] })
+    const first = { summary: 'First formal version.', keyPoints: [], relations: [], openQuestions: [] }
+    const second = { summary: 'Second formal version.', keyPoints: [], relations: [], openQuestions: [] }
+    service.saveTopicWikiDraft(topic.id, { content: first, baseRevision: revision, generatedAt: '', provider: 'local', model: 'test', checks: [], runId: run.id })
+    expect(service.applyTopicWikiDraft(topic.id)).toMatchObject({ version: 1, lastEditSource: 'ai', latestRun: { id: run.id } })
+    service.saveTopicWikiDraft(topic.id, { content: second, baseRevision: revision, generatedAt: '', provider: 'local', model: 'test', checks: [] })
+    expect(service.applyTopicWikiDraft(topic.id)).toMatchObject({ version: 2, content: { summary: 'Second formal version.' } })
+    expect(service.listTopicWikiRevisions(topic.id).map((item) => item.version)).toEqual([2, 1])
+    expect(service.revertTopicWikiRevision(topic.id, 1)).toMatchObject({ version: 3, content: { summary: 'First formal version.' }, lastEditSource: 'revert' })
+    expect(service.listTopicWikiRevisions(topic.id).map((item) => item.version)).toEqual([3, 2, 1])
   })
 
   it('stores PDF page numbers on material chunks', async () => {

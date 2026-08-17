@@ -11,6 +11,130 @@ const service = (wireApi: ProviderProfile['wireApi']) => new AiService({} as Wor
 afterEach(() => vi.unstubAllGlobals())
 
 describe('AiService protocol requests', () => {
+  it('repairs a non-JSON canvas response before creating proposals', async () => {
+    const workspace = {
+      topicMap: vi.fn().mockReturnValue({
+        topic: { id: 'topic-1', revision: 2 },
+        materials: [{ id: 'm1', title: 'First', excerpt: 'First material', extractedText: null }, { id: 'm2', title: 'Second', excerpt: 'Second material', extractedText: null }],
+        workstreams: [],
+        relations: []
+      }),
+      getSettings: vi.fn().mockReturnValue(settings('profile')),
+      createTopicProposalRun: vi.fn(),
+      createTopicProposals: vi.fn().mockReturnValue([{ id: 'proposal-1' }])
+    }
+    const validPlan = JSON.stringify({ summary: 'Connect the two materials.', actions: [{ id: 'local-1', kind: 'create_relation', reason: 'The materials are sequential.', evidence: 'The supplied summaries describe an ordered handoff.', payload: { sourceMaterialId: 'm1', targetMaterialId: 'm2', label: 'next', relationType: 'next', confidence: .8 } }], warnings: [] })
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ choices: [{ message: { content: 'I cannot produce that plan.' } }] }), { headers: { 'content-type': 'application/json' } }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ choices: [{ message: { content: validPlan } }] }), { headers: { 'content-type': 'application/json' } }))
+    vi.stubGlobal('fetch', fetchMock)
+    const ai = new AiService(workspace as unknown as WorkspaceService, { getProfile: () => profile('chat_completions'), getApiKey: () => 'test-key' } as unknown as AppStore)
+    const plan = await ai.planCanvas({ topicId: 'topic-1', selectedMaterialIds: ['m1', 'm2'], instruction: 'Connect the materials.', baseRevision: 2, allowCloud: true })
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(plan.actions[0].id).toBe('proposal-1')
+    expect(workspace.createTopicProposalRun).toHaveBeenCalledOnce()
+    expect(workspace.createTopicProposals).toHaveBeenCalledOnce()
+  })
+
+  it('generates a topic Wiki draft through bounded evidence-first stages without applying it', async () => {
+    const workspace = {
+      topicMap: vi.fn().mockReturnValue({ topic: { id: 'topic-wiki', name: 'Workflow', description: '', revision: 4 }, materials: [{ id: 'm1', title: 'First', excerpt: 'First step.', extractedText: 'First step.', workstreamId: null }], workstreams: [], relations: [] }),
+      getSettings: vi.fn().mockReturnValue(settings('profile')),
+      listMaterialChunks: vi.fn().mockReturnValue([{ id: 'c1', text: 'First step is documented.', heading: 'Steps' }]),
+      saveTopicWikiDraft: vi.fn().mockImplementation((_topicId, draft) => ({ topicId: 'topic-wiki', status: 'draft', draft, content: null }))
+    }
+    const outline = { summaryFocus: 'A documented workflow.', keyPoints: [{ focus: 'First step is documented.', evidenceChunkIds: ['c1'] }], relations: [], openQuestions: [] }
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify(outline) }, finish_reason: 'stop' }] }), { headers: { 'content-type': 'application/json' } }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify({ summary: 'A documented workflow.' }) }, finish_reason: 'stop' }] }), { headers: { 'content-type': 'application/json' } }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify({ items: [{ text: 'First step is documented.', evidenceChunkIds: ['c1'] }] }) }, finish_reason: 'stop' }] }), { headers: { 'content-type': 'application/json' } }))
+    vi.stubGlobal('fetch', fetchMock)
+    const ai = new AiService(workspace as unknown as WorkspaceService, { getProfile: () => profile('chat_completions'), getApiKey: () => 'test-key' } as unknown as AppStore)
+    const result = await ai.generateTopicWiki('topic-wiki')
+    expect(result).toMatchObject({ status: 'draft' })
+    expect(workspace.saveTopicWikiDraft).toHaveBeenCalledWith('topic-wiki', expect.objectContaining({ baseRevision: 4, content: expect.objectContaining({ summary: 'A documented workflow.' }) }))
+    expect(fetchMock).toHaveBeenCalledTimes(3)
+    expect(String(fetchMock.mock.calls[0][1]?.body)).toContain('"max_tokens":1600')
+  })
+
+  it('reports provider billing errors with the response detail', async () => {
+    const workspace = {
+      topicMap: vi.fn().mockReturnValue({ topic: { id: 'topic-wiki', name: 'Workflow', description: '', revision: 4 }, materials: [{ id: 'm1', title: 'First', excerpt: 'First step.', extractedText: 'First step.', workstreamId: null }], workstreams: [], relations: [] }),
+      getSettings: vi.fn().mockReturnValue(settings('profile')),
+      listMaterialChunks: vi.fn().mockReturnValue([{ id: 'c1', text: 'First step is documented.', heading: 'Steps' }])
+    }
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify({ error: { message: 'Insufficient balance.' } }), { status: 402, headers: { 'content-type': 'application/json' } })))
+    const ai = new AiService(workspace as unknown as WorkspaceService, { getProfile: () => profile('chat_completions'), getApiKey: () => 'test-key' } as unknown as AppStore)
+    await expect(ai.generateTopicWiki('topic-wiki')).rejects.toThrow(/HTTP 402.*Insufficient balance/i)
+  })
+
+  it('disables DeepSeek thinking and retries one invalid structured stage', async () => {
+    const workspace = {
+      topicMap: vi.fn().mockReturnValue({ topic: { id: 'topic-wiki', name: 'Workflow', description: '', revision: 4 }, materials: [{ id: 'm1', title: 'First', excerpt: 'First step.', extractedText: 'First step.', workstreamId: null }], workstreams: [], relations: [] }),
+      getSettings: vi.fn().mockReturnValue({ ...settings('profile'), baseUrl: 'https://api.deepseek.com', chatModel: 'deepseek-v4-flash' }),
+      listMaterialChunks: vi.fn().mockReturnValue([{ id: 'c1', text: 'First step is documented.', heading: 'Steps' }]),
+      saveTopicWikiDraft: vi.fn().mockImplementation((_topicId, draft) => ({ topicId: 'topic-wiki', status: 'draft', draft, content: null }))
+    }
+    const outline = { summaryFocus: 'A documented workflow.', keyPoints: [{ focus: 'First step is documented.', evidenceChunkIds: ['c1'] }], relations: [], openQuestions: [] }
+    const fetchMock = vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ choices: [{ message: { content: 'not json', reasoning_content: 'internal reasoning' }, finish_reason: 'stop' }] }), { headers: { 'content-type': 'application/json' } }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify(outline), reasoning_content: 'should not be parsed' }, finish_reason: 'stop' }] }), { headers: { 'content-type': 'application/json' } }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify({ summary: 'A documented workflow.' }) }, finish_reason: 'stop' }] }), { headers: { 'content-type': 'application/json' } }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify({ items: [{ text: 'First step is documented.', evidenceChunkIds: ['c1'] }] }) }, finish_reason: 'stop' }] }), { headers: { 'content-type': 'application/json' } }))
+    vi.stubGlobal('fetch', fetchMock)
+    const deepSeekProfile: ProviderProfile = { ...profile('chat_completions'), baseUrl: 'https://api.deepseek.com' }
+    const ai = new AiService(workspace as unknown as WorkspaceService, { getProfile: () => deepSeekProfile, getApiKey: () => 'test-key' } as unknown as AppStore)
+    await expect(ai.generateTopicWiki('topic-wiki')).resolves.toMatchObject({ status: 'draft' })
+    const firstBody = JSON.parse(String(fetchMock.mock.calls[0][1]?.body)) as { thinking?: { type?: string } }
+    expect(firstBody.thinking?.type).toBe('disabled')
+    expect(String(fetchMock.mock.calls[1][1]?.body)).toContain('Retry this stage')
+    expect(workspace.saveTopicWikiDraft).toHaveBeenCalledWith('topic-wiki', expect.objectContaining({ warnings: [] }))
+  })
+
+  it('keeps a valid draft when one Wiki section is truncated', async () => {
+    const workspace = {
+      topicMap: vi.fn().mockReturnValue({ topic: { id: 'topic-wiki', name: 'Workflow', description: '', revision: 4 }, materials: [{ id: 'm1', title: 'First', excerpt: 'First step.', extractedText: 'First step.', workstreamId: null }], workstreams: [], relations: [] }),
+      getSettings: vi.fn().mockReturnValue(settings('profile')),
+      listMaterialChunks: vi.fn().mockReturnValue([{ id: 'c1', text: 'First step is documented.', heading: 'Steps' }]),
+      saveTopicWikiDraft: vi.fn().mockImplementation((_topicId, draft) => ({ topicId: 'topic-wiki', status: 'draft', draft, content: null }))
+    }
+    const outline = { summaryFocus: 'Fallback summary.', keyPoints: [{ focus: 'Fallback conclusion.', evidenceChunkIds: ['c1'] }], relations: [], openQuestions: [] }
+    vi.stubGlobal('fetch', vi.fn()
+      .mockResolvedValueOnce(new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify(outline) }, finish_reason: 'stop' }] }), { headers: { 'content-type': 'application/json' } }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ choices: [{ message: { content: '{"summary":"truncated' }, finish_reason: 'length' }] }), { headers: { 'content-type': 'application/json' } }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify({ items: [] }) }, finish_reason: 'stop' }] }), { headers: { 'content-type': 'application/json' } }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify({ items: [] }) }, finish_reason: 'stop' }] }), { headers: { 'content-type': 'application/json' } }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify({ items: [] }) }, finish_reason: 'stop' }] }), { headers: { 'content-type': 'application/json' } })))
+    const ai = new AiService(workspace as unknown as WorkspaceService, { getProfile: () => profile('chat_completions'), getApiKey: () => 'test-key' } as unknown as AppStore)
+    await ai.generateTopicWiki('topic-wiki')
+    expect(workspace.saveTopicWikiDraft).toHaveBeenCalledWith('topic-wiki', expect.objectContaining({ content: expect.objectContaining({ summary: 'Fallback summary.', keyPoints: [{ text: 'Fallback conclusion.', evidence: [expect.objectContaining({ chunkId: 'c1' })] }] }) }))
+  })
+
+  it('allows a local OpenAI-compatible endpoint without cloud consent', async () => {
+    const workspace = {
+      topicMap: vi.fn().mockReturnValue({ topic: { id: 'topic-local', revision: 1 }, materials: [{ id: 'm1', title: 'First', excerpt: 'First', extractedText: null }], workstreams: [], relations: [] }),
+      getSettings: vi.fn().mockReturnValue({ ...settings('profile'), baseUrl: 'http://127.0.0.1:1234/v1', allowCloud: false }),
+      createTopicProposalRun: vi.fn(),
+      createTopicProposals: vi.fn().mockReturnValue([])
+    }
+    const localProfile: ProviderProfile = { ...profile('chat_completions'), baseUrl: 'http://127.0.0.1:1234/v1' }
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify({ summary: 'No changes', actions: [], warnings: [] }) } }] }), { headers: { 'content-type': 'application/json' } })))
+    const ai = new AiService(workspace as unknown as WorkspaceService, { getProfile: () => localProfile, getApiKey: () => 'local-key' } as unknown as AppStore)
+    await expect(ai.planCanvas({ topicId: 'topic-local', selectedMaterialIds: ['m1'], instruction: 'Review this material.', baseRevision: 1, allowCloud: false })).resolves.toMatchObject({ actions: [] })
+  })
+
+  it('keeps the two explicit consent checks for cloud canvas plans', async () => {
+    const workspace = {
+      topicMap: vi.fn().mockReturnValue({ topic: { id: 'topic-cloud', revision: 1 }, materials: [{ id: 'm1', title: 'First', excerpt: 'First', extractedText: null }], workstreams: [], relations: [] }),
+      getSettings: vi.fn().mockReturnValue(settings('profile'))
+    }
+    const fetchMock = vi.fn()
+    vi.stubGlobal('fetch', fetchMock)
+    const ai = new AiService(workspace as unknown as WorkspaceService, { getProfile: () => profile('chat_completions'), getApiKey: () => 'test-key' } as unknown as AppStore)
+    await expect(ai.planCanvas({ topicId: 'topic-cloud', selectedMaterialIds: ['m1'], instruction: 'Review this material.', baseRevision: 1, allowCloud: false })).rejects.toThrow(/workspace consent and the request checkbox/i)
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
   it('calls the model with workspace context when arbitrary wording has no retrieval hits', async () => {
     const workspace = {
       searchKnowledgeAsync: vi.fn().mockResolvedValue({ hits: [], mode: 'fts' }),

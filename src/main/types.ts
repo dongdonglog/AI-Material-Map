@@ -115,10 +115,30 @@ export interface KnowledgeQuestion {
 export interface SearchOptions { limit?: number; sourceId?: string }
 export interface AnswerOptions extends SearchOptions { allowCloud?: boolean }
 export type ProposalStatus = 'pending' | 'accepted' | 'archived'
-export interface TopicProposal { id: string; topicId: string; kind: string; reason: string; evidence: string; materialId: string | null; relationId: string | null; payload: Record<string, unknown>; status: ProposalStatus; createdAt: string; updatedAt: string }
+export type TopicViewMode = 'map' | 'flow'
+export type CanvasActionKind = 'create_relation' | 'create_workstream' | 'rename_relation' | 'set_sequence' | 'set_card_style' | 'layout'
+export interface CanvasAiRequest { topicId: string; selectedMaterialIds: string[]; instruction: string; baseRevision: number; allowCloud: boolean; maxActions?: number; maxContextChars?: number }
+export interface CanvasAction { id: string; kind: CanvasActionKind; reason: string; evidence: string; materialId?: string | null; relationId?: string | null; payload: Record<string, unknown> }
+export interface CanvasAiPlan { runId: string; topicId: string; baseRevision: number; summary: string; actions: CanvasAction[]; warnings: string[]; model: { provider: string; model: string } }
+export type TopicProposalSource = 'legacy' | 'canvas-ai' | 'chat'
+export type TopicProposalRunStatus = 'pending' | 'complete' | 'partial' | 'failed' | 'applied'
+export interface TopicProposalRun { id: string; topicId: string; baseRevision: number; instruction: string; provider: string; model: string; summary: string; status: TopicProposalRunStatus; createdAt: string; updatedAt: string }
+export interface TopicProposal { id: string; topicId: string; kind: string; reason: string; evidence: string; materialId: string | null; relationId: string | null; payload: Record<string, unknown>; status: ProposalStatus; createdAt: string; updatedAt: string; runId?: string | null; baseRevision?: number | null; source?: TopicProposalSource; stale?: boolean }
+export type TopicWikiPageStatus = 'empty' | 'current' | 'needs-update' | 'draft' | 'needs-review'
+export interface TopicWikiEvidence { materialId: string; chunkId: string | null; title: string; excerpt: string; heading: string | null; startOffset?: number | null; endOffset?: number | null; pageNumber?: number | null }
+export interface TopicWikiBullet { text: string; evidence: TopicWikiEvidence[] }
+export interface TopicWikiRelation { sourceMaterialId: string; targetMaterialId: string; label: string; explanation: string; evidence: TopicWikiEvidence[] }
+export interface TopicWikiContent { summary: string; keyPoints: TopicWikiBullet[]; relations: TopicWikiRelation[]; openQuestions: TopicWikiBullet[] }
+export interface TopicWikiDraft { content: TopicWikiContent; baseRevision: number; generatedAt: string; provider: string; model: string; checks: string[]; runId?: string | null; warnings?: string[] }
+export type TopicWikiRunStatus = 'running' | 'complete' | 'partial' | 'failed' | 'cancelled'
+export type TopicWikiRunStage = 'outline' | 'summary' | 'keyPoints' | 'relations' | 'openQuestions' | 'saving' | 'complete'
+export interface TopicWikiRun { id: string; topicId: string; baseRevision: number; provider: string; model: string; status: TopicWikiRunStatus; stage: TopicWikiRunStage; error: string | null; warnings: string[]; startedAt: string; completedAt: string | null; updatedAt: string }
+export type TopicWikiEditSource = 'ai' | 'user' | 'revert'
+export interface TopicWikiRevision { id: string; topicId: string; version: number; content: TopicWikiContent; sourceRevision: number; editSource: TopicWikiEditSource; provider: string | null; model: string | null; createdAt: string }
+export interface TopicWikiPage { topicId: string; pageType: 'overview'; content: TopicWikiContent | null; sourceRevision: number | null; updatedAt: string | null; draft: TopicWikiDraft | null; canUndo: boolean; version: number; lastEditSource: TopicWikiEditSource | null; lastProvider: string | null; lastModel: string | null; latestRun: TopicWikiRun | null; status: TopicWikiPageStatus; checks: string[] }
 
-export interface Topic { id: string; name: string; description: string | null; createdAt: string; archivedAt: string | null; color: string; revision: number }
-export interface Workstream { id: string; topicId: string; name: string; position: number; source: 'ai' | 'manual' }
+export interface Topic { id: string; name: string; description: string | null; createdAt: string; archivedAt: string | null; color: string; revision: number; viewMode: TopicViewMode; confirmedOnly: boolean; focusedWorkstreamId: string | null }
+export interface Workstream { id: string; topicId: string; name: string; position: number; source: 'ai' | 'manual'; color: string; collapsed: boolean }
 export type RelationWaypoint = { x: number; y: number }
 export type LineDash = 'auto' | 'solid' | 'dashed' | 'dotted'
 export interface Relation {

@@ -1,4 +1,5 @@
-import type { AnalysisSummary, GroundedAnswer, KnowledgeChatTurn, KnowledgeQuestion, Material, MaterialAnalysisCard, ModelSettings, ProviderProfile, ProviderProfileInput, RelationAiExplanationFailureReason, RelationAiExplanationResult, SearchHit, TopicMap, TopicProposal, TopicRelationCandidate } from './types'
+import { randomUUID } from 'node:crypto'
+import type { AnalysisSummary, CanvasAiPlan, CanvasAiRequest, GroundedAnswer, KnowledgeChatTurn, KnowledgeQuestion, Material, MaterialAnalysisCard, ModelSettings, ProviderProfile, ProviderProfileInput, RelationAiExplanationFailureReason, RelationAiExplanationResult, SearchHit, TopicMap, TopicProposal, TopicRelationCandidate, TopicWikiContent, TopicWikiDraft, TopicWikiPage } from './types'
 import { WorkspaceService } from './workspace-service'
 import { AppStore } from './app-store'
 import connectionSkill from './ai-skills/topic-connection.md?raw'
@@ -6,6 +7,9 @@ import operationSkill from './ai-skills/topic-operation.md?raw'
 import { topicToolContext } from './topic-tools'
 import { chunkHash, tokenize } from './indexer'
 import { MaterialMapMcpServer } from './material-mcp'
+import { parseCanvasAiPlan } from './canvas-plan-validator'
+import { buildTopicWikiEvidencePacket, fallbackTopicWikiContent, fallbackTopicWikiOutline, outlinePrompt, parseModelJson, parseTopicWikiOutline, parseTopicWikiSection, sectionPrompt, type TopicWikiOutline, type TopicWikiSection } from './topic-wiki-generation'
+import { requiresCloudConsent } from '../shared/ai-provider'
 
 interface TopicAnalysisResult {
   workstreams?: Array<{ name: string; materialIds: string[] }>
@@ -13,10 +17,14 @@ interface TopicAnalysisResult {
   relations: Array<{ sourceMaterialId: string; targetMaterialId: string; relationType?: string; label?: string; evidence: string; confidence?: number }>
 }
 
+class TopicWikiProviderError extends Error {}
+
 const workflowRelations: Record<string, string> = { next: '下一步', depends_on: '依赖', explains: '解释', evidences: '佐证', implements: '实现', tests: '验证', blocks: '阻塞', improves: '改进', reviews: '复盘', references: '参考', related: '关联' }
 export interface AiActionProposal { id: string; kind: 'create_relation' | 'create_workstream' | 'delete_ai_relation' | 'rename_relation' | 'set_sequence' | 'set_card_style' | 'layout'; reason: string; evidence: string; materialId?: string; relationId?: string; payload?: Record<string, unknown> }
 
 const workspaceCatalogBudget = 24_000
+const wikiOutlineTokens = 1_600
+const wikiSectionTokens: Record<TopicWikiSection, number> = { summary: 900, keyPoints: 1_600, relations: 1_600, openQuestions: 1_200 }
 
 function workspaceCatalog(materials: Material[]): { hits: SearchHit[]; omitted: number } {
   const hits: SearchHit[] = []
@@ -176,7 +184,7 @@ export class AiService {
   async validate(settings: ModelSettings, topicId?: string): Promise<Array<{ id: string; ok: boolean; detail: string; status?: number; durationMs: number }>> {
     const profile = this.profileFor(settings)
     if (!settings.enabled || !settings.chatModel) return [{ id: 'configuration', ok: false, detail: 'Enable analysis and select a chat model before validation.', durationMs: 0 }]
-    if (settings.provider !== 'ollama' && !settings.allowCloud) return [{ id: 'configuration', ok: false, detail: 'Enable cloud consent before validation.', durationMs: 0 }]
+    if (this.needsCloudConsent(settings, profile) && !settings.allowCloud) return [{ id: 'configuration', ok: false, detail: 'Enable cloud consent before validation.', durationMs: 0 }]
     if (topicId) {
       const map = this.workspace.topicMap(topicId)
       if (map.materials.length < 2) return [{ id: 'configuration', ok: false, detail: 'The AI demonstration topic needs at least two materials.', durationMs: 0 }]
@@ -238,7 +246,7 @@ export class AiService {
     const settings = this.workspace.getSettings()
     if (!map.materials.length) throw new Error('Add materials to this topic before analysis.')
     if (!settings.enabled || !settings.chatModel) throw new Error('Enable analysis and select a chat model in workspace settings first.')
-    if (settings.provider !== 'ollama' && !settings.allowCloud) throw new Error('Cloud analysis requires explicit consent in settings.')
+    if (this.needsCloudConsent(settings) && !settings.allowCloud) throw new Error('Cloud analysis requires explicit consent in settings.')
     const jobs = map.materials.map((material) => ({ materialId: material.id, jobId: this.workspace.startJob(material.id, 'ai-analysis') }))
     try {
       const result = await this.requestTopic(settings, map)
@@ -343,7 +351,7 @@ export class AiService {
     if (!settings.enabled || !settings.profileId || !settings.chatModel) throw new Error('请先在“模型与隐私”中添加并启用 AI 配置后再提问。')
     const profile = this.appStore.getProfile(settings.profileId)
     if (!profile || (profile.provider !== 'ollama' && !profile.hasApiKey)) throw new Error('当前 AI 配置不完整，请在“模型与隐私”中重新配置。')
-    if (profile.provider !== 'ollama' && !settings.allowCloud) throw new Error('请先在“模型与隐私”中确认允许将材料发送到外部 AI 服务。')
+    if (this.needsCloudConsent(settings, profile) && !settings.allowCloud) throw new Error('请先在“模型与隐私”中确认允许将材料发送到外部 AI 服务。')
     const history: KnowledgeChatTurn[] = (typeof input === 'string' || !Array.isArray(input.history) ? [] : input.history)
       .filter((turn): turn is KnowledgeChatTurn => Boolean(turn) && (turn.role === 'user' || turn.role === 'assistant') && typeof turn.content === 'string')
       .slice(-8)
@@ -476,7 +484,7 @@ ${retrievalContext || '(none found; answer only from the catalog and summaries a
     if (!source || !target) throw new Error('Relationship material is unavailable.')
     const settings = this.workspace.getSettings()
     if (!settings.enabled || !settings.chatModel) return failure('not-configured', '请先在设置中启用 AI 并选择聊天模型。')
-    if (settings.provider !== 'ollama' && !settings.allowCloud) return failure('no-consent', '使用云端模型解释关系前，请在设置中明确同意云端处理。')
+    if (this.needsCloudConsent(settings) && !settings.allowCloud) return failure('no-consent', '使用云端模型解释关系前，请在设置中明确同意云端处理。')
     // Context window: at most 2 chunks per side, 500 characters each.
     const windows = (materialId: string) => this.workspace.materialEvidenceWindow(materialId, `${source.title} ${target.title}`, 1).slice(0, 2).map((chunk) => ({ heading: chunk.heading, text: chunk.text.slice(0, 500) }))
     const prompt = `Explain or reject exactly one locally discovered relationship. Use only the supplied evidence. Return ONLY JSON: {"supported":true,"sourceMaterialId":"${source.id}","targetMaterialId":"${target.id}","relationType":"references|depends_on|evidences|implements|tests|related","label":"short Chinese label","explanation":"one concise Chinese explanation","confidence":0.0}. Keep the supplied direction unless evidence clearly supports reversing it. Local evidence: ${JSON.stringify(relation.evidence.map((item) => item.text))}. Source: ${JSON.stringify({ id: source.id, title: source.title, excerpts: windows(source.id) })}. Target: ${JSON.stringify({ id: target.id, title: target.title, excerpts: windows(target.id) })}`
@@ -506,7 +514,7 @@ ${retrievalContext || '(none found; answer only from the catalog and summaries a
     const map = this.workspace.topicMap(topicId); const settings = this.workspace.getSettings()
     if (!map.materials.length) throw new Error('Add materials to this topic before analysis.')
     if (!settings.enabled || !settings.chatModel) throw new Error('Enable analysis and select a chat model in workspace settings first.')
-    if (settings.provider !== 'ollama' && !settings.allowCloud) throw new Error('Cloud analysis requires explicit consent in settings.')
+    if (this.needsCloudConsent(settings) && !settings.allowCloud) throw new Error('Cloud analysis requires explicit consent in settings.')
     const summary: AnalysisSummary = { topicId, processed: 0, addedWorkstreams: 0, addedRelations: 0, failures: [] }
     const run = this.workspace.startTopicAnalysisRun(topicId, map.topic.revision, map.materials.length); summary.runId = run.id
     const jobs = map.materials.map((material) => ({ materialId: material.id, jobId: this.workspace.startJob(material.id, 'ai-analysis') }))
@@ -537,7 +545,7 @@ ${retrievalContext || '(none found; answer only from the catalog and summaries a
 
   private async embed(texts: string[]): Promise<number[][] | null> {
     const settings = this.workspace.getSettings(); if (!settings.embeddingModel) return null
-    if (settings.provider !== 'ollama' && !settings.allowCloud) return null
+    if (this.needsCloudConsent(settings) && !settings.allowCloud) return null
     const profile = this.profileFor(settings); const base = profile.baseUrl.replace(/\/$/, ''); const headers = { 'Content-Type': 'application/json', ...this.headers(profile) }
     if (profile.provider === 'ollama') {
       const response = await fetch(`${base}/api/embed`, { method: 'POST', headers, body: JSON.stringify({ model: settings.embeddingModel, input: texts }) })
@@ -557,7 +565,7 @@ ${retrievalContext || '(none found; answer only from the catalog and summaries a
     if (!question.trim()) throw new Error('Describe the requested board change.')
     const settings = this.workspace.getSettings()
     if (!settings.enabled || !settings.chatModel) throw new Error('Enable a model before requesting board suggestions.')
-    if (settings.provider !== 'ollama' && !settings.allowCloud) throw new Error('Cloud analysis requires explicit consent in settings.')
+    if (this.needsCloudConsent(settings) && !settings.allowCloud) throw new Error('Cloud analysis requires explicit consent in settings.')
     const skill = this.readSkill('topic-operation.md')
     const context = topicToolContext(map)
     const prompt = `${skill}\nYou are calling the local topic tools. First inspect this context, then return ONLY JSON matching this schema: {"answer":"short answer","proposedActions":[{"id":"local-id","kind":"create_relation|create_workstream|delete_ai_relation|rename_relation|set_sequence|set_card_style|layout","reason":"why","evidence":"supporting text from context","materialId":"optional","relationId":"optional","payload":{}}]}. For a connection, payload MUST contain sourceMaterialId, targetMaterialId, label, relationType, confidence. Never return prose outside JSON.\nActive topic context: ${JSON.stringify(context)}\nUser request: ${question}`
@@ -576,6 +584,146 @@ ${retrievalContext || '(none found; answer only from the catalog and summaries a
     const validated = (result.proposedActions ?? []).filter((action) => this.validProposal(map, action)).slice(0, 8)
     const actions = this.workspace.createTopicProposals(topicId, validated.map((action) => ({ kind: action.kind, reason: action.reason, evidence: action.evidence, materialId: action.materialId ?? null, relationId: action.relationId ?? null, payload: action.payload ?? {} })))
     return { answer: result.answer?.trim() || '已根据当前主题生成可审阅的建议。', proposedActions: actions }
+  }
+
+  async planCanvas(input: CanvasAiRequest): Promise<CanvasAiPlan> {
+    const map = this.workspace.topicMap(input.topicId)
+    const baseRevision = Number(input.baseRevision)
+    if (!Number.isInteger(baseRevision) || baseRevision < 0 || baseRevision !== map.topic.revision) throw new Error('The topic changed. Refresh the canvas before asking AI for a plan.')
+    const selectedIds = [...new Set((input.selectedMaterialIds.length ? input.selectedMaterialIds : map.materials.map((material) => material.id)).map(String))]
+    if (!selectedIds.length || selectedIds.length > 200) throw new Error('Select between one and 200 materials for a canvas plan.')
+    const materialIds = new Set(map.materials.map((material) => material.id))
+    if (selectedIds.some((materialId) => !materialIds.has(materialId))) throw new Error('The selection contains a material outside this topic.')
+    if (!input.instruction.trim() || input.instruction.trim().length > 1200) throw new Error('Describe the board change in 1,200 characters or less.')
+    const settings = this.workspace.getSettings()
+    if (!settings.enabled || !settings.chatModel) throw new Error('Enable a model before requesting a canvas plan.')
+    const profile = this.profileFor(settings)
+    if (this.needsCloudConsent(settings, profile) && (!settings.allowCloud || !input.allowCloud)) throw new Error('Cloud analysis requires explicit consent in settings and this request. Enable the workspace consent and the request checkbox before generating a cloud plan.')
+    const runId = randomUUID()
+    const maxContextChars = Math.max(4000, Math.min(Number(input.maxContextChars ?? 24000), 50000))
+    let used = 0
+    const selected = map.materials.filter((material) => selectedIds.includes(material.id)).map((material) => {
+      const summary = String(material.extractedText || material.excerpt || '').replace(/\s+/gu, ' ').trim().slice(0, 1000)
+      const value = { id: material.id, title: material.title.slice(0, 160), summary }
+      used += JSON.stringify(value).length
+      return used <= maxContextChars ? value : { id: material.id, title: material.title.slice(0, 160), summary: '' }
+    })
+    const relationIds = new Set(map.relations.map((relation) => relation.id))
+    const context = { materials: selected, workstreams: map.workstreams.map((stream) => ({ id: stream.id, name: stream.name, materialIds: map.materials.filter((material) => material.workstreamId === stream.id).map((material) => material.id) })), relations: map.relations.slice(0, 120).map((relation) => ({ id: relation.id, sourceMaterialId: relation.sourceMaterialId, targetMaterialId: relation.targetMaterialId, label: relation.label, relationType: relation.relationType })) }
+    const prompt = `You are the canvas co-creator inside Material Map. Return ONLY JSON: {"summary":"short Chinese summary","actions":[{"id":"local-id","kind":"create_relation|create_workstream|rename_relation|set_sequence|set_card_style|layout","reason":"why","evidence":"supporting evidence from the supplied materials","materialId":null,"relationId":null,"payload":{}}],"warnings":[]}. Only propose changes supported by supplied material summaries. Never delete materials, write files, or invent IDs. For create_relation payload requires sourceMaterialId,targetMaterialId,label,relationType,confidence. For create_workstream payload requires name,materialIds. For layout payload requires positions:[{materialId,x,y}]. Current topic revision: ${baseRevision}. Current topic context: ${JSON.stringify(context)}. User instruction: ${input.instruction.trim()}`
+    const response = await this.chat(profile, settings.chatModel, prompt, true)
+    if (!response.ok) throw new Error(`Canvas plan request returned HTTP ${response.status}.`)
+    const validationContext = { topicId: input.topicId, baseRevision, materialIds, relationIds, provider: profile.provider, model: settings.chatModel, runId, maxActions: input.maxActions }
+    const raw = this.responseText(await this.responseJson(response, 'Canvas plan'))
+    let plan: CanvasAiPlan
+    try {
+      plan = parseCanvasAiPlan(raw, validationContext)
+    } catch (firstError) {
+      const repairPrompt = `The previous canvas plan was invalid. Return ONLY one valid JSON object matching this schema, with no markdown, prose, or code fences: {"summary":"short summary","actions":[{"id":"local-id","kind":"create_relation|create_workstream|rename_relation|set_sequence|set_card_style|layout","reason":"why","evidence":"supporting evidence","materialId":null,"relationId":null,"payload":{}}],"warnings":[]}. Use only the supplied material and relation IDs. Never delete materials or write files. Previous output: ${raw.slice(0, 2400)}`
+      const repair = await this.chat(profile, settings.chatModel, repairPrompt, true)
+      if (!repair.ok) throw new Error(`Canvas plan JSON was invalid and the repair request returned HTTP ${repair.status}.`)
+      try {
+        const repairedRaw = this.responseText(await this.responseJson(repair, 'Canvas plan repair'))
+        plan = parseCanvasAiPlan(repairedRaw, validationContext)
+      } catch (secondError) {
+        const detail = secondError instanceof Error ? secondError.message : firstError instanceof Error ? firstError.message : 'unknown validation error'
+        throw new Error(`Canvas AI returned an invalid plan. No changes were made. ${detail}`)
+      }
+    }
+    this.workspace.createTopicProposalRun({ id: runId, topicId: input.topicId, baseRevision, instruction: input.instruction.trim(), provider: profile.provider, model: settings.chatModel, summary: plan.summary, status: plan.actions.length ? 'complete' : 'partial' })
+    const proposals = this.workspace.createTopicProposals(input.topicId, plan.actions.map((action) => ({ kind: action.kind, reason: action.reason, evidence: action.evidence, materialId: action.materialId ?? null, relationId: action.relationId ?? null, payload: action.payload, runId, baseRevision, source: 'canvas-ai' as const })))
+    return { ...plan, actions: plan.actions.map((action, index) => ({ ...action, id: proposals[index]?.id ?? action.id })) }
+  }
+
+  async generateTopicWiki(topicId: string): Promise<TopicWikiPage> {
+    const map = this.workspace.topicMap(topicId)
+    const settings = this.workspace.getSettings()
+    if (!settings.enabled || !settings.chatModel) throw new Error('Enable a model before generating the topic Wiki.')
+    const profile = this.profileFor(settings)
+    if (this.needsCloudConsent(settings, profile) && !settings.allowCloud) throw new Error('Cloud Wiki generation requires explicit consent in settings.')
+    const wikiRuns = this.workspace as unknown as { startTopicWikiRun?: (id: string, revision: number, provider: string, model: string) => { id: string }; updateTopicWikiRun?: (id: string, stage: TopicWikiSection | 'outline' | 'saving', warnings?: string[]) => unknown; finishTopicWikiRun?: (id: string, status: 'complete' | 'partial' | 'failed', error?: string | null, warnings?: string[]) => unknown }
+    const run = wikiRuns.startTopicWikiRun?.(topicId, map.topic.revision, profile.provider, settings.chatModel)
+    const warnings: string[] = []
+    const updateRun = (stage: TopicWikiSection | 'outline' | 'saving'): void => { if (run) wikiRuns.updateTopicWikiRun?.(run.id, stage, warnings) }
+    const finishRun = (status: 'complete' | 'partial' | 'failed', error: string | null = null): void => { if (run) wikiRuns.finishTopicWikiRun?.(run.id, status, error, warnings) }
+    const chunksByMaterial = new Map(map.materials.map((material) => [material.id, this.workspace.listMaterialChunks(material.id)]))
+    const packet = buildTopicWikiEvidencePacket(map, chunksByMaterial)
+    if (!packet.materials.length) {
+      const error = 'Add indexed material to this topic before generating the Wiki.'
+      finishRun('failed', error)
+      throw new Error(error)
+    }
+    try {
+      const reasonCode = (error: unknown): string => {
+        const message = error instanceof Error ? error.message.toLowerCase() : ''
+        if (message.includes('truncated') || message.includes('length') || message.includes('max_tokens')) return 'truncated'
+        if (message.includes('empty response') || message.includes('no output')) return 'empty'
+        if (message.includes('no supported')) return 'unsupported'
+        return 'invalid-json'
+      }
+      const addFallback = (stage: string, error: unknown): void => {
+        warnings.push(`${stage}-fallback:${reasonCode(error)}`)
+      }
+      const requestStage = async <T>(prompt: string, operation: string, maxTokens: number, parse: (raw: string) => T): Promise<T> => {
+        let lastError: unknown = new Error(`${operation} returned invalid JSON.`)
+        for (let attempt = 0; attempt < 2; attempt += 1) {
+          try {
+            const retryPrompt = attempt === 0 ? prompt : `${prompt}\nRetry this stage. Return exactly one complete JSON object, with no Markdown, reasoning, or explanation. Keep every string concise so the object finishes within the output limit.`
+            const raw = await this.requestTopicWikiJson(profile, settings.chatModel, retryPrompt, operation, attempt === 0 ? maxTokens : Math.min(maxTokens * 2, 3_200))
+            return parse(raw)
+          } catch (error) {
+            if (error instanceof TopicWikiProviderError) throw error
+            lastError = error
+          }
+        }
+        throw lastError
+      }
+      let outline: TopicWikiOutline
+      updateRun('outline')
+      try {
+        outline = await requestStage(outlinePrompt(packet), 'Topic Wiki outline', wikiOutlineTokens, (raw) => {
+          const parsed = parseTopicWikiOutline(raw, packet)
+          if (!parsed.summaryFocus && !parsed.keyPoints.length && !parsed.relations.length && !parsed.openQuestions.length) throw new Error('The outline contained no supported Wiki items.')
+          return parsed
+        })
+      } catch (error) {
+        if (error instanceof TopicWikiProviderError) throw error
+        addFallback('outline', error)
+        outline = fallbackTopicWikiOutline(packet)
+      }
+      const content = fallbackTopicWikiContent(packet, outline)
+      const fill = async (section: TopicWikiSection): Promise<void> => {
+        const hasInputs = section === 'summary' || (section === 'keyPoints' ? outline.keyPoints.length > 0 : section === 'relations' ? outline.relations.length > 0 : outline.openQuestions.length > 0)
+        if (!hasInputs) return
+        updateRun(section)
+        try {
+          const parsed = await requestStage(sectionPrompt(section, packet, outline), `Topic Wiki ${section}`, wikiSectionTokens[section], (raw) => {
+            const result = parseTopicWikiSection(raw, section, packet)
+            if (section === 'summary' && !result.summary) throw new Error(`${section} returned no supported content.`)
+            if (section === 'keyPoints' && !result.keyPoints?.length) throw new Error(`${section} returned no supported content.`)
+            if (section === 'relations' && !result.relations?.length) throw new Error(`${section} returned no supported content.`)
+            if (section === 'openQuestions' && !result.openQuestions?.length) throw new Error(`${section} returned no supported content.`)
+            return result
+          })
+          if (section === 'summary' && parsed.summary) content.summary = parsed.summary
+          else if (section === 'keyPoints' && parsed.keyPoints?.length) content.keyPoints = parsed.keyPoints
+          else if (section === 'relations' && parsed.relations?.length) content.relations = parsed.relations
+          else if (section === 'openQuestions' && parsed.openQuestions?.length) content.openQuestions = parsed.openQuestions
+        } catch (error) {
+          if (error instanceof TopicWikiProviderError) throw error
+          addFallback(section, error)
+        }
+      }
+      for (const section of ['summary', 'keyPoints', 'relations', 'openQuestions'] as const) await fill(section)
+      updateRun('saving')
+      const draft: TopicWikiDraft = { content, baseRevision: map.topic.revision, generatedAt: new Date().toISOString(), provider: profile.provider, model: settings.chatModel, checks: [], runId: run?.id ?? null, warnings }
+      const saved = this.workspace.saveTopicWikiDraft(topicId, draft)
+      finishRun(warnings.length ? 'partial' : 'complete')
+      return saved
+    } catch (error) {
+      finishRun('failed', error instanceof Error ? error.message : 'Topic Wiki generation failed.')
+      throw error
+    }
   }
 
   private materialCards(map: TopicMap, modelId: string): MaterialAnalysisCard[] {
@@ -676,6 +824,7 @@ ${retrievalContext || '(none found; answer only from the catalog and summaries a
     if (settings.profileId) { const profile = this.appStore.getProfile(settings.profileId); if (profile) return profile }
     return { id: '', name: 'Local Ollama', provider: 'ollama', baseUrl: settings.baseUrl, wireApi: 'chat_completions', models: [], recommendedModel: null, updatedAt: '', hasApiKey: false }
   }
+  private needsCloudConsent(settings: ModelSettings, profile = this.profileFor(settings)): boolean { return requiresCloudConsent(profile.provider, profile.baseUrl || settings.baseUrl) }
   private headers(profile: ProviderProfile): Record<string, string> {
     const key = profile.id ? this.appStore.getApiKey(profile.id) : null
     if (profile.provider === 'ollama') return {}
@@ -702,22 +851,50 @@ ${retrievalContext || '(none found; answer only from the catalog and summaries a
     } catch (error) { lastError = error instanceof Error ? error.message : lastError }
     throw new Error(lastError)
   }
+  private async requestTopicWikiJson(profile: ProviderProfile, model: string, prompt: string, operation: string, maxTokens: number): Promise<string> {
+    const response = await this.chatWithBudget(profile, model, prompt, true, maxTokens)
+    if (!response.ok) throw await this.topicWikiProviderError(response, operation)
+    const body = await this.responseJson(response, operation)
+    const finishReason = this.finishReason(body)
+    if (finishReason && /length|max_tokens|token_limit|insufficient_system_resource|content_filter/i.test(finishReason)) throw new Error(`${operation} was truncated or filtered by the model (${finishReason}).`)
+    const text = this.responseText(body, true)
+    if (!text.trim()) throw new Error(`${operation} returned an empty response.`)
+    return text
+  }
+  private async topicWikiProviderError(response: Response, operation: string): Promise<TopicWikiProviderError> {
+    let preview = ''
+    try {
+      const body = await response.text()
+      preview = body.replace(/Bearer\s+\S+/giu, 'Bearer [redacted]').replace(/sk-[A-Za-z0-9_-]+/gu, '[redacted]').replace(/\s+/gu, ' ').trim().slice(0, 600)
+    } catch { /* The HTTP status is still actionable when the provider closes the response body. */ }
+    return new TopicWikiProviderError(`${operation} request returned HTTP ${response.status}${preview ? `: ${preview}` : ''}`)
+  }
+  private finishReason(body: Record<string, unknown>): string | null {
+    const choice = (body.choices as Array<{ finish_reason?: unknown }> | undefined)?.[0]
+    const candidate = (body.candidates as Array<{ finishReason?: unknown }> | undefined)?.[0]
+    const response = body.response as Record<string, unknown> | undefined
+    const value = choice?.finish_reason ?? candidate?.finishReason ?? body.finish_reason ?? body.done_reason ?? response?.finish_reason
+    return typeof value === 'string' && value.trim() ? value.trim() : null
+  }
   private async chat(profile: ProviderProfile, model: string, prompt: string, json: boolean, parentSignal?: AbortSignal): Promise<Response> {
+    return this.chatWithBudget(profile, model, prompt, json, json ? 450 : 1000, parentSignal)
+  }
+  private async chatWithBudget(profile: ProviderProfile, model: string, prompt: string, json: boolean, maxTokens: number, parentSignal?: AbortSignal): Promise<Response> {
     const base = profile.baseUrl.replace(/\/$/, ''); const headers = { 'Content-Type': 'application/json', ...this.headers(profile) }
     const timeout = AbortSignal.timeout(90_000); const signal = parentSignal ? AbortSignal.any([timeout, parentSignal]) : timeout
-    const maxTokens = json ? 450 : 1000
     if (profile.provider === 'ollama') return fetch(`${base}/api/generate`, { method: 'POST', headers, signal, body: JSON.stringify({ model, prompt, stream: false, options: { num_predict: maxTokens, temperature: json ? 0.1 : 0.3 }, ...(json ? { format: 'json' } : {}) }) })
     if (profile.provider === 'anthropic') return fetch(`${base}/messages`, { method: 'POST', headers, signal, body: JSON.stringify({ model, max_tokens: maxTokens, messages: [{ role: 'user', content: prompt }], ...(json ? { temperature: 0.1 } : {}) }) })
     if (profile.provider === 'gemini') return fetch(`${base}/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(this.appStore.getApiKey(profile.id) ?? '')}`, { method: 'POST', headers, signal, body: JSON.stringify({ contents: [{ role: 'user', parts: [{ text: prompt }] }], generationConfig: { maxOutputTokens: maxTokens, ...(json ? { temperature: 0.1, responseMimeType: 'application/json' } : {}) } }) })
     if (profile.wireApi === 'responses') return fetch(`${base}/responses`, { method: 'POST', headers, signal, body: JSON.stringify({ model, input: prompt, store: false, max_output_tokens: maxTokens, ...(json ? { temperature: 0.1, text: { format: { type: 'json_object' } } } : {}) }) })
-    return fetch(`${base}/chat/completions`, { method: 'POST', headers, signal, body: JSON.stringify({ model, messages: [{ role: 'user', content: prompt }], max_tokens: maxTokens, ...(json ? { temperature: 0.1, response_format: { type: 'json_object' } } : {}) }) })
+    const deepSeekJson = json && profile.provider === 'compatible' && (/deepseek/i.test(model) || /deepseek\.com/i.test(base))
+    return fetch(`${base}/chat/completions`, { method: 'POST', headers, signal, body: JSON.stringify({ model, messages: [{ role: 'user', content: prompt }], max_tokens: maxTokens, ...(json ? { temperature: 0.1, response_format: { type: 'json_object' }, ...(deepSeekJson ? { thinking: { type: 'disabled' } } : {}) } : {}) }) })
   }
-  private responseText(body: Record<string, unknown>): string {
+  private responseText(body: Record<string, unknown>, structured = false): string {
     const direct = typeof body.output_text === 'string' ? body.output_text : undefined
     const output = (body.output as Array<{ content?: Array<{ text?: string }> }> | undefined)?.flatMap((item) => item.content ?? []).map((item) => item.text ?? '').join('')
     const firstChoice = (body.choices as Array<{ message?: { content?: string | Array<{ text?: string }>; reasoning_content?: string }; text?: string; delta?: { content?: string } }> | undefined)?.[0]
     const messageContent = firstChoice?.message?.content
-    const openAi = typeof messageContent === 'string' ? messageContent : Array.isArray(messageContent) ? messageContent.map((item) => item.text ?? '').join('') : firstChoice?.text ?? firstChoice?.delta?.content ?? firstChoice?.message?.reasoning_content
+    const openAi = typeof messageContent === 'string' ? messageContent : Array.isArray(messageContent) ? messageContent.map((item) => item.text ?? '').join('') : firstChoice?.text ?? firstChoice?.delta?.content ?? (structured ? undefined : firstChoice?.message?.reasoning_content)
     const anthropic = (body.content as Array<{ text?: string }> | undefined)?.map((item) => item.text ?? '').join('')
     const gemini = (body.candidates as Array<{ content?: { parts?: Array<{ text?: string }> } }> | undefined)?.[0]?.content?.parts?.map((part) => part.text ?? '').join('')
     return String(direct ?? output ?? body.response ?? openAi ?? anthropic ?? gemini ?? '')

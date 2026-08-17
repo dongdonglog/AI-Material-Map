@@ -1,5 +1,5 @@
 import { expect, test } from 'playwright/test'
-import { closeApp, electronAvailable, launchApp, seedWorkspace, type LaunchedApp } from './helpers'
+import { closeApp, electronAvailable, launchApp, openWorkspaceWindow, seedWorkspace, type LaunchedApp } from './helpers'
 
 /**
  * 画板（Topic Canvas / Whiteboard）：节点渲染、端口连接、属性编辑、布局持久化。
@@ -17,20 +17,24 @@ type CanvasApi = {
     create(name: string): Promise<{ id: string }>
     addMaterials(topicId: string, materialIds: string[]): Promise<unknown>
     positionMaterial(topicId: string, materialId: string, x: number, y: number): Promise<unknown>
-    map(topicId: string): Promise<{ materials: Array<{ id: string; x?: number; y?: number }>; relations: unknown[] }>
+    map(topicId: string): Promise<{ materials: Array<{ id: string; canvasX?: number; canvasY?: number }>; relations: unknown[] }>
   }
   materials: { list(): Promise<Array<{ id: string; title: string }>> }
 }
 
 async function seedCanvas(window: LaunchedApp['window'], workspaceRoot: string): Promise<string> {
   await seedWorkspace(window, workspaceRoot)
-  return window.evaluate(async () => {
+  const topicId = await window.evaluate(async () => {
     const api = (window as unknown as { materialMap: CanvasApi }).materialMap
     const topic = await api.topics.create('Canvas Topic')
     const materials = await api.materials.list()
     await api.topics.addMaterials(topic.id, materials.map((material) => material.id))
     return topic.id
   })
+  await openWorkspaceWindow(window, workspaceRoot)
+  await window.locator('.topic-item', { hasText: 'Canvas Topic' }).click()
+  await window.locator('.whiteboard-stage').waitFor()
+  return topicId
 }
 
 test.describe('画板：节点、连接、属性与布局', () => {
@@ -38,9 +42,6 @@ test.describe('画板：节点、连接、属性与布局', () => {
     launched = await launchApp()
     const { window, workspaceRoot } = launched
     await seedCanvas(window, workspaceRoot)
-    await window.reload()
-    await window.waitForLoadState('domcontentloaded')
-
     // 打开主题画板视图
     const canvasEntry = window.locator('.topic-view, .whiteboard, .flow-map').first()
     if (!(await canvasEntry.count())) {
@@ -56,9 +57,6 @@ test.describe('画板：节点、连接、属性与布局', () => {
     launched = await launchApp()
     const { window, workspaceRoot } = launched
     await seedCanvas(window, workspaceRoot)
-    await window.reload()
-    await window.waitForLoadState('domcontentloaded')
-
     const stage = window.locator('.whiteboard-stage, .flow-map, .react-flow').first()
     if (!(await stage.count())) {
       await window.locator('.nav-item', { hasText: /Topic|主题|画板|Canvas/ }).first().click()
@@ -80,14 +78,15 @@ test.describe('画板：节点、连接、属性与布局', () => {
     }, topicId)
 
     // 重新打开应用后验证位置仍然生效
-    await closeApp(launched)
+    await launched.app.close()
+    launched = null
     launched = await launchApp()
     const reopened = await launched.window.evaluate(async ({ root, id, materialId }) => {
       const api = (window as unknown as { materialMap: CanvasApi & { workspace: { open(root: string): Promise<unknown> } } }).materialMap
       await api.workspace.open(root)
       const map = await api.topics.map(id)
       const node = map.materials.find((material) => material.id === materialId)
-      return { x: node?.x, y: node?.y }
+      return { x: node?.canvasX, y: node?.canvasY }
     }, { root: workspaceRoot, id: topicId, materialId: persisted })
 
     expect(reopened.x).toBe(420)

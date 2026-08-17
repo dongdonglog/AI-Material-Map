@@ -1,7 +1,7 @@
 import { existsSync } from 'node:fs'
 import { join } from 'node:path'
 import { expect, test } from 'playwright/test'
-import { closeApp, electronAvailable, launchApp, seedWorkspace, type LaunchedApp } from './helpers'
+import { closeApp, electronAvailable, launchApp, openWorkspaceWindow, seedWorkspace, type LaunchedApp } from './helpers'
 
 /**
  * 工作区生命周期：创建 → 打开 → 导出 → 导入
@@ -24,8 +24,7 @@ test.describe('工作区创建/打开/导出/导入', () => {
   test('创建工作区后进入应用主界面', async () => {
     launched = await launchApp()
     await seedWorkspace(launched.window, launched.workspaceRoot)
-    await launched.window.reload()
-    await launched.window.waitForLoadState('domcontentloaded')
+    await openWorkspaceWindow(launched.window, launched.workspaceRoot)
     await expect(launched.window.locator('.app-shell, .sidebar').first()).toBeVisible()
   })
 
