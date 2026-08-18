@@ -15,6 +15,7 @@ export interface MaterialRelation { id:string; sourceMaterialId:string; targetMa
 export interface RelationAiExplanation { supported:boolean; sourceMaterialId:string; targetMaterialId:string; relationType:string; label:string; explanation:string; confidence:number }
 export interface TopicRelationCandidateRecord { id:string; topicId:string; sourceMaterialId:string; targetMaterialId:string; sharedTags:string[]; score:number; status:'visible'|'hidden'|'accepted'; createdAt:string; updatedAt:string }
 export type TopicViewMode = 'map' | 'flow'
+export type TopicWorkspaceView = 'canvas' | 'wiki'
 export type CanvasActionKind = 'create_relation' | 'create_workstream' | 'rename_relation' | 'set_sequence' | 'set_card_style' | 'layout'
 export interface CanvasAiRequest { topicId:string; selectedMaterialIds:string[]; instruction:string; baseRevision:number; allowCloud:boolean; maxActions?:number; maxContextChars?:number }
 export interface CanvasAction { id:string; kind:CanvasActionKind; reason:string; evidence:string; materialId?:string|null; relationId?:string|null; payload:Record<string, unknown> }

@@ -1,9 +1,10 @@
 import React, { useEffect, useState } from 'react'
 import { Archive, ArrowLeft, Plus, Search, Upload } from 'lucide-react'
-import type { Material, Topic, TopicMap, Workspace } from './types'
+import type { Material, Topic, TopicMap, TopicWorkspaceView, Workspace } from './types'
 import type { EvidenceFocus } from './lib/evidence-focus'
 import { syncImportNotices, type ImportNotice } from './import-state'
 import { TopicBoardPage as TopicBoard } from './features/topics/TopicBoardPage'
+import { TopicViewTabs } from './features/topics/TopicViewTabs'
 import { SourcePanel } from './features/sources/SourcePanel'
 import { Welcome } from './components/Welcome'
 import { Sidebar } from './components/Sidebar'
@@ -31,6 +32,7 @@ export default function App(): React.ReactElement {
   const [explorerMaterialId, setExplorerMaterialId] = useState<string | null>(null)
   const [explorerEvidenceFocus, setExplorerEvidenceFocus] = useState<EvidenceFocus | null>(null)
   const [activeTopic, setActiveTopic] = useState<TopicMap | null>(null)
+  const [topicView, setTopicView] = useState<TopicWorkspaceView>('canvas')
   const [query, setQuery] = useState('')
   const [showNote, setShowNote] = useState(false)
   const [showLink, setShowLink] = useState(false)
@@ -112,6 +114,7 @@ export default function App(): React.ReactElement {
 
   const openTopic = async (topic: Topic) => {
     try {
+      setTopicView('canvas')
       setActiveTopic(await window.materialMap.topics.map(topic.id) as TopicMap)
       setSelected(null)
       setShowExplorer(false)
@@ -202,6 +205,7 @@ export default function App(): React.ReactElement {
     await window.materialMap.topics.addMaterials(topic.id, materialIds)
     await refresh()
     setActiveTopic(await window.materialMap.topics.map(topic.id) as TopicMap)
+    setTopicView('canvas')
     setSelected(null)
     setShowChat(false)
     setMessage(t('app.materialsAdded', { count: materialIds.length }))
@@ -304,12 +308,15 @@ export default function App(): React.ReactElement {
           void importPaths(paths, false, activeTopic ? { topicId: activeTopic.topic.id, position: { x: 180, y: 140 } } : undefined)
         }}
       >
-        <header className="topbar">
-          <div>
+        <header className={`topbar${activeTopic ? ' topic-topbar' : ''}`}>
+          <div className={activeTopic ? 'topic-heading' : undefined}>
             {activeTopic ? (
               <>
-                <button className="back-button" onClick={() => { setActiveTopic(null); setShowChat(false) }}><ArrowLeft size={17}/>{t('app.backToWorkbench')}</button>
-                <h1>{activeTopic.topic.name}</h1>
+                <div className="topic-heading-title">
+                  <button className="back-button" onClick={() => { setActiveTopic(null); setShowChat(false); setTopicView('canvas') }}><ArrowLeft size={17}/>{t('app.backToWorkbench')}</button>
+                  <h1>{activeTopic.topic.name}</h1>
+                </div>
+                <TopicViewTabs view={topicView} onChange={setTopicView} />
               </>
             ) : showExplorer ? (
               <>
@@ -352,8 +359,10 @@ export default function App(): React.ReactElement {
         )}
         {activeTopic ? (
           <TopicBoard
+            key={activeTopic.topic.id}
             map={activeTopic}
             materials={materials}
+            view={topicView}
             onRefresh={topicRefresh}
             onImportFiles={(paths, position) => importPaths(paths, false, { topicId: activeTopic.topic.id, position })}
           />

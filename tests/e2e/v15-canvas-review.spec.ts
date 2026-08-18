@@ -55,13 +55,30 @@ async function startWikiModel(): Promise<string> {
       const prompt = String((JSON.parse(body) as { prompt?: string }).prompt ?? '')
       if (prompt.includes('planning a topic Wiki')) {
         const packet = JSON.parse(prompt.slice(prompt.indexOf('Topic packet: ') + 'Topic packet: '.length)) as { materials: Array<{ id: string; evidence: Array<{ chunkId: string }> }> }
-        const material = packet.materials[0]; const chunkId = material?.evidence[0]?.chunkId
-        response.end(JSON.stringify({ response: JSON.stringify({ summaryFocus: 'A cited local overview.', keyPoints: [{ focus: 'The first material establishes the topic.', evidenceChunkIds: [chunkId] }], relations: [], openQuestions: [] }) }))
+        const [first, second] = packet.materials
+        const firstChunk = first?.evidence[0]?.chunkId
+        const secondChunk = second?.evidence[0]?.chunkId
+        response.end(JSON.stringify({ response: JSON.stringify({
+          summaryFocus: '本主题整理 Go 服务端开发的基础能力与 HTTP 实践路径。',
+          keyPoints: [
+            { focus: 'Go 的并发模型和标准库适合构建可维护的服务端程序。', evidenceChunkIds: [firstChunk] },
+            { focus: 'HTTP 服务需要统一路由、超时控制与可观测性。', evidenceChunkIds: [secondChunk] }
+          ],
+          relations: [{ sourceMaterialId: first?.id, targetMaterialId: second?.id, label: '基础到实践', focus: '语言基础支撑 HTTP 服务的工程实现。', evidenceChunkIds: [firstChunk] }],
+          openQuestions: [{ focus: '如何为高并发请求补充限流与优雅关闭策略？', evidenceChunkIds: [secondChunk] }]
+        }) }))
         return
       }
       const evidence = JSON.parse(prompt.slice(prompt.indexOf('Evidence: ') + 'Evidence: '.length)) as Array<{ materialId: string; chunkId: string }>
-      const first = evidence[0]
-      const content = prompt.includes('Return {"summary"') ? { summary: 'A cited local overview.' } : prompt.includes('for key conclusions') ? { items: [{ text: 'The first material establishes the topic.', evidenceChunkIds: [first?.chunkId] }] } : { items: [] }
+      const outline = JSON.parse(prompt.slice(prompt.indexOf('Outline: ') + 'Outline: '.length, prompt.indexOf(' Evidence: '))) as { relations: Array<{ sourceMaterialId: string; targetMaterialId: string }> }
+      const [first, second = first] = evidence
+      const content = prompt.includes('Return {"summary"')
+        ? { summary: '本主题以 Go 服务端开发为主线，从语言并发能力与标准库出发，进一步连接到 HTTP 路由、超时控制、日志与可观测性实践，形成从基础知识到工程落地的阅读路径。' }
+        : prompt.includes('for key conclusions')
+          ? { items: [{ text: 'Go 的并发模型和标准库适合构建结构清晰、易于维护的服务端程序。', evidenceChunkIds: [first?.chunkId] }, { text: 'HTTP 服务应统一处理路由、超时、错误响应和可观测性。', evidenceChunkIds: [second?.chunkId] }] }
+          : prompt.includes('Return {"items":[{"sourceMaterialId"')
+            ? { items: [{ sourceMaterialId: outline.relations[0]?.sourceMaterialId, targetMaterialId: outline.relations[0]?.targetMaterialId, label: '基础到实践', explanation: '语言基础为 HTTP 服务中的并发处理、错误管理和生命周期控制提供实现基础。', evidenceChunkIds: [first?.chunkId] }] }
+            : { items: [{ text: '如何在高并发场景下补充限流、追踪与优雅关闭策略？', evidenceChunkIds: [first?.chunkId] }] }
       response.end(JSON.stringify({ response: JSON.stringify(content) }))
     })
   })
@@ -111,7 +128,7 @@ test.describe('v1.5 canvas proposal review', () => {
     }, setup.topicId)).toEqual({ pending: 0, proposedRelations: 1, workstreams: [{ name: 'Review lane', source: 'ai' }], undo: true })
   })
 
-  test('opens the topic Wiki reader without changing the canvas', async () => {
+  test('switches to the full topic Wiki workspace while keeping the canvas mounted', async () => {
     launched = await launchApp()
     const { window, workspaceRoot } = launched
     await seedWorkspace(window, workspaceRoot)
@@ -132,9 +149,14 @@ test.describe('v1.5 canvas proposal review', () => {
     await window.locator('.app-shell').waitFor()
     await window.locator('.topic-item', { hasText: topicName }).click()
     await expect(window.locator('.whiteboard-stage')).toBeVisible()
-    await window.locator('button.wiki-tool').click()
-    await expect(window.locator('.topic-wiki-panel')).toBeVisible()
+    await expect(window.getByRole('tab', { name: '主题画板' })).toHaveAttribute('aria-selected', 'true')
+    await window.getByRole('tab', { name: '主题 Wiki' }).click()
+    await expect(window.locator('.topic-wiki-workspace')).toBeVisible()
     await expect(window.getByText('还没有主题 Wiki')).toBeVisible()
+    await expect(window.locator('.topic-wiki-material-groups button').first()).toBeVisible()
+    await expect(window.locator('.whiteboard-stage')).toHaveCount(1)
+    await expect(window.locator('.whiteboard-stage')).toBeHidden()
+    await window.getByRole('tab', { name: '主题画板' }).click()
     await expect(window.locator('.whiteboard-stage')).toBeVisible()
   })
 
@@ -142,8 +164,13 @@ test.describe('v1.5 canvas proposal review', () => {
     const modelBaseUrl = await startWikiModel()
     launched = await launchApp()
     const { window, workspaceRoot } = launched
-    await seedWorkspace(window, workspaceRoot)
-    const topicName = `Wiki evidence ${Date.now()}`
+    await window.evaluate(async (root) => {
+      const api = (window as unknown as { materialMap: any }).materialMap
+      await api.workspace.create(root, 'Go 服务端知识库')
+      await api.materials.document('01-Go语言基础.md', '# Go 语言基础\nGo 通过 goroutine、channel 和标准库支持高并发服务，并保持代码结构清晰。', 'md')
+      await api.materials.document('02-HTTP服务实践.md', '# HTTP 服务实践\nHTTP 服务需要统一路由、超时控制、错误响应、日志与可观测性。', 'md')
+    }, workspaceRoot)
+    const topicName = 'Go 服务端开发'
     await window.evaluate(async ({ name, baseUrl }) => {
       const api = (window as unknown as { materialMap: any }).materialMap
       for (let attempt = 0; attempt < 100; attempt += 1) {
@@ -160,18 +187,66 @@ test.describe('v1.5 canvas proposal review', () => {
     await window.reload()
     await window.locator('button', { hasText: workspaceRoot }).click()
     await window.locator('.topic-item', { hasText: topicName }).click()
-    await window.locator('button.wiki-tool').click()
+    await window.getByRole('tab', { name: '主题 Wiki' }).click()
     await window.getByRole('button', { name: '生成 Wiki' }).click()
     await expect(window.locator('.topic-wiki-draft-banner')).toBeVisible()
     await expect(window.locator('.topic-wiki-evidence button').first()).toBeVisible()
+    await window.getByRole('button', { name: '忽略草稿' }).click()
+    await expect(window.getByText('Wiki 草稿已忽略。')).toBeVisible()
+    await expect(window.locator('.topic-wiki-draft-banner')).toHaveCount(0)
+    await window.getByRole('button', { name: '生成 Wiki' }).click()
+    await expect(window.locator('.topic-wiki-draft-banner')).toBeVisible()
     await window.getByRole('button', { name: '应用草稿' }).click()
     await expect(window.getByText('Wiki 草稿已应用。')).toBeVisible()
     await window.getByRole('button', { name: '版本历史' }).click()
-    await expect(window.locator('.topic-wiki-history')).toBeVisible()
-    await expect(window.getByText('版本 1')).toBeVisible()
-    await window.locator('.topic-wiki-history header .icon-button').click()
+    await expect(window.locator('.topic-wiki-history-dialog')).toBeVisible()
+    await expect(window.locator('.topic-wiki-history-dialog').getByText('版本 1', { exact: true })).toBeVisible()
+    await window.locator('.topic-wiki-history-dialog > header .icon-button').click()
+    await window.locator('.topic-wiki-material-groups button').first().click()
+    await expect(window.locator('.topic-wiki-evidence-panel')).toBeVisible()
+    await expect(window.locator('.topic-wiki-source-title h2')).toBeVisible()
+    await expect(window.locator('[data-evidence-highlight]')).toHaveCount(0)
+    await window.getByRole('button', { name: '关闭证据原文' }).click()
     await window.locator('.topic-wiki-evidence button').first().click()
+    await expect(window.locator('.topic-wiki-evidence-panel')).toBeVisible()
     await expect(window.locator('.evidence-locator')).toBeVisible()
     await expect(window.locator('[data-evidence-highlight]')).toBeVisible()
+    await expect(window.locator('.topbar h1')).toHaveText(topicName)
+    await window.getByRole('button', { name: '关闭证据原文' }).click()
+    await expect(window.locator('.topic-wiki-evidence-panel')).toHaveCount(0)
+    await expect(window.locator('.topic-wiki-workspace')).toBeVisible()
+    await window.getByRole('button', { name: '撤销应用' }).click()
+    await expect(window.getByText('已恢复到上一个正式版本。')).toBeVisible()
+    await expect(window.getByText('还没有主题 Wiki')).toBeVisible()
+  })
+
+  test('uses drawers for Wiki navigation and evidence in a narrow window', async () => {
+    launched = await launchApp()
+    const { window, workspaceRoot } = launched
+    await seedWorkspace(window, workspaceRoot)
+    const topicName = `Wiki narrow ${Date.now()}`
+    await window.evaluate(async (name) => {
+      const api = (window as unknown as { materialMap: any }).materialMap
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        const jobs = await api.jobs()
+        if (jobs.every((job: { status: string }) => job.status === 'complete' || job.status === 'failed')) break
+        await new Promise((resolve) => window.setTimeout(resolve, 50))
+      }
+      const materials = await api.materials.list()
+      const topic = await api.topics.create(name)
+      await api.topics.addMaterials(topic.id, materials.map((material: { id: string }) => material.id))
+    }, topicName)
+    await window.reload()
+    await window.setViewportSize({ width: 900, height: 760 })
+    await window.locator('button', { hasText: workspaceRoot }).click()
+    await window.locator('.topic-item', { hasText: topicName }).click()
+    await window.getByRole('tab', { name: '主题 Wiki' }).click()
+    await window.getByRole('button', { name: 'Wiki 导航' }).click()
+    await expect(window.locator('.topic-wiki-navigation.mobile-open')).toBeVisible()
+    await window.locator('.topic-wiki-material-groups button').first().click()
+    await expect(window.locator('.topic-wiki-evidence-panel')).toBeVisible()
+    const boxes = await Promise.all([window.locator('.topic-wiki-reader').boundingBox(), window.locator('.topic-wiki-evidence-panel').boundingBox()])
+    expect(boxes.every(Boolean)).toBe(true)
+    expect((boxes[1]?.x ?? -1) + (boxes[1]?.width ?? 0)).toBeLessThanOrEqual(901)
   })
 })

@@ -75,9 +75,9 @@ Use the AI action in a topic board to create suggestions from selected material.
 
 ### 6. Generate and review a topic Wiki
 
-Open **Topic Wiki** from the topic-board toolbar to generate an overview for the current topic. The result is a draft based only on that topic's materials and relations. It includes a summary, key conclusions, material relations, open questions, and evidence citations.
+Open a topic and switch between **Topic Board** and **Topic Wiki** from the tabs in the topic header. Topic Wiki is a full reading workspace: chapters and workflow-grouped materials stay on the left, the overview is read in the center, and cited source material opens on the right. The generated result is a draft based only on that topic's materials and relations. It includes a summary, key conclusions, material relations, open questions, and evidence citations.
 
-Review the draft and its diff before applying it. Evidence links open the original material at the cited location. The version history can restore an earlier published version. When topic materials or relations change, the Wiki is marked as needing an update, but AI is never invoked automatically.
+Review the draft and its diff before applying it. Evidence links open the existing material reader at the cited location without leaving the topic Wiki. The version history can restore an earlier published version. When topic materials or relations change, the Wiki is marked as needing an update, but AI is never invoked automatically.
 
 The Wiki status also identifies missing cited material or excerpts, an outdated topic revision, and conclusions without evidence.
 
