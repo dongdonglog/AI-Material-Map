@@ -1,6 +1,8 @@
 import { createWriteStream, existsSync, mkdirSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from 'node:fs'
 import { copyFile, readFile, stat, writeFile } from 'node:fs/promises'
 import { basename, dirname, extname, join, resolve } from 'node:path'
+import { mkdtemp, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
 import { createHash, randomUUID } from 'node:crypto'
 import chokidar, { type FSWatcher } from 'chokidar'
 import { ZipArchive } from 'archiver'
@@ -12,13 +14,21 @@ import { detectVectorCapability, type VectorCapability } from './db/vector-capab
 import { VectorStore } from './db/vector-store'
 import { NativeDatabase } from './db/native-database'
 import { stableTopicOrder, topologyPositions } from '../shared/topic-topology'
-import type { AnalysisStatus, Entity, EntityMention, EntityMentionSource, EntityType, FolderSource, Job, LineDash, Material, MaterialAnalysisCard, MaterialChunk, MaterialRelation, MaterialRelationStatus, MaterialTag, ModelSettings, Relation, RelationWaypoint, RelationshipEvidence, SearchHit, Topic, TopicAnalysisRun, TopicCandidateStatus, TopicEditorCommand, TopicHistoryStatus, TopicRelationCandidate, TopicRelationCandidateRecord, TopicMap, TopicProposal, TopicProposalRun, TopicProposalRunStatus, TopicProposalSource, TopicViewMode, TopicWikiContent, TopicWikiDraft, TopicWikiEditSource, TopicWikiEvidence, TopicWikiPage, TopicWikiRevision, TopicWikiRun, TopicWikiRunStage, TopicWikiRunStatus, WorkspaceSummary, Workstream } from './types'
+import type { AnalysisStatus, Entity, EntityMention, EntityMentionSource, EntityType, FolderSource, Job, LineDash, Material, MaterialAnalysisCard, MaterialChunk, MaterialRelation, MaterialRelationStatus, MaterialTag, ModelSettings, Relation, RelationWaypoint, RelationshipEvidence, SearchHit, Topic, TopicAnalysisRun, TopicCandidateStatus, TopicEditorCommand, TopicHistoryStatus, TopicRelationCandidate, TopicRelationCandidateRecord, TopicMap, TopicProposal, TopicProposalRun, TopicProposalRunStatus, TopicProposalSource, TopicViewMode, TopicWikiBullet, TopicWikiContent, TopicWikiDraft, TopicWikiEditSource, TopicWikiEvidence, TopicWikiPage, TopicWikiRelation, TopicWikiRevision, TopicWikiRun, TopicWikiRunStage, TopicWikiRunStatus, WorkspaceSummary, Workstream } from './types'
 
 type SqlRow = Record<string, unknown>
 interface WorkspaceConfig { id: string; name: string; encrypted: boolean; salt?: string }
 const now = () => new Date().toISOString()
 const id = () => randomUUID()
 const MAX_AUTO_EXTRACT_BYTES = 10 * 1024 * 1024
+
+const yamlScalar = (value: string): string => JSON.stringify(value)
+const yamlList = (values: string[]): string => values.length ? `[${values.map(yamlScalar).join(', ')}]` : '[]'
+const safeFileName = (value: string, fallback: string): string => {
+  const normalized = value.replace(/[<>:"/\\|?*\u0000-\u001f]/g, '_').trim()
+  return (normalized || fallback).slice(0, 120)
+}
+const okfFrontmatter = (fields: Array<[string, string | null | undefined]>): string => `---\n${fields.filter(([, value]) => value !== null && value !== undefined).map(([key, value]) => `${key}: ${value}`).join('\n')}\n---\n\n`
 
 // Chinese questions contain many grammatical words that are useful to a
 // person but make a lexical search noisy. Keep this list deliberately small:
@@ -1751,6 +1761,89 @@ export class WorkspaceService {
       if (entry.size !== undefined && content.byteLength !== entry.size) throw new Error(`Workspace package checksum size mismatch: ${entry.path}`)
       if (createHash('sha256').update(content).digest('hex') !== entry.sha256) throw new Error(`Workspace package checksum mismatch: ${entry.path}`)
     }
+  }
+  async exportOkfPackage(destination: string): Promise<{ destination: string; topicCount: number; topicPageCount: number; materialCount: number; copiedMaterialCount: number; unavailableMaterialCount: number; staleTopicCount: number; warnings: string[] }> {
+    if (!destination || !destination.toLowerCase().endsWith('.okf.zip')) throw new Error('OKF 导出文件必须使用 .okf.zip 扩展名。')
+    const temp = await mkdtemp(join(tmpdir(), 'material-map-okf-'))
+    const warnings: string[] = []
+    let copiedMaterialCount = 0
+    let unavailableMaterialCount = 0
+    let topicPageCount = 0
+    let staleTopicCount = 0
+    try {
+      const topics = this.query('SELECT * FROM topics ORDER BY archived_at IS NULL DESC, created_at ASC').map(asTopic)
+      const materials = this.listMaterials()
+      const topicEntries: string[] = []
+      const materialEntries: string[] = []
+      const write = (path: string, content: string | Buffer): void => { const file = join(temp, path); mkdirSync(dirname(file), { recursive: true }); writeFileSync(file, content) }
+      for (const material of materials) {
+        const materialPath = `materials/${material.id}.md`
+        const extension = extname(material.sourcePath ?? material.storedPath ?? '') || (material.type === 'note' ? '.txt' : '.bin')
+        let resource: string | null = null
+        let original: Buffer | null = null
+        if (material.type === 'link' && material.url) resource = material.url
+        else if (material.storedPath) {
+          const stored = join(this.materialsPath(), material.storedPath)
+          if (existsSync(stored)) {
+            try { original = this.config?.encrypted ? decrypt(readFileSync(stored), this.key!) : readFileSync(stored) } catch { original = null }
+          }
+        } else if (material.sourcePath && existsSync(material.sourcePath)) {
+          try { original = readFileSync(material.sourcePath) } catch { original = null }
+        } else if (material.type === 'note') original = Buffer.from(material.extractedText ?? material.excerpt ?? '', 'utf8')
+        if (original) {
+          const originalPath = `references/materials/${material.id}/original${extension}`
+          write(originalPath, original); resource = `/${originalPath}`; copiedMaterialCount += 1
+        } else if (material.type !== 'link') {
+          unavailableMaterialCount += 1
+          warnings.push(`材料不可用：${material.title}`)
+        }
+        const body = material.extractedText ?? material.excerpt ?? (material.url ? `[原始链接](${material.url})` : '材料没有可导出的正文。')
+        write(materialPath, okfFrontmatter([
+          ['type', yamlScalar('Source Material')], ['title', yamlScalar(material.title)], ['description', yamlScalar((material.excerpt ?? '').replace(/\s+/g, ' ').slice(0, 240))],
+          ['resource', resource ? yamlScalar(resource) : null], ['tags', yamlList([])], ['generated', `{ by: ${yamlScalar('material-map/' + (this.config?.id ?? 'workspace'))}, at: ${yamlScalar(material.importedAt)} }`],
+          ['status', yamlScalar(material.availability === 'available' ? 'stable' : 'deprecated')], ['material_map_id', yamlScalar(material.id)], ['material_map_type', yamlScalar(material.type)], ['material_map_availability', yamlScalar(material.availability)]
+        ]) + `# ${material.title}\n\n${body}\n`)
+        materialEntries.push(`* [${material.title.replace(/[\[\]]/g, '')}](/${materialPath}) - ${material.excerpt ? material.excerpt.replace(/\s+/g, ' ').slice(0, 160) : material.type}`)
+      }
+      for (const topic of topics) {
+        const page = this.getTopicWiki(topic.id)
+        const topicPath = `topics/${topic.id}.md`
+        const status = topic.archivedAt ? 'deprecated' : page.status === 'needs-review' ? 'draft' : 'stable'
+        const hasContent = Boolean(page.content)
+        const stale = page.status === 'needs-update' || page.status === 'needs-review'
+        if (stale) staleTopicCount += 1
+        if (hasContent) {
+          const content = page.content!
+          const sourceIds = new Set<string>()
+          const footnotes = new Map<string, string>()
+          const citation = (evidence: TopicWikiEvidence[]): string => evidence.map((item) => {
+            const id = `material-${item.materialId}${item.chunkId ? `-${item.chunkId}` : ''}`.replace(/[^A-Za-z0-9_-]/g, '-')
+            sourceIds.add(item.materialId)
+            if (!footnotes.has(id)) footnotes.set(id, `${item.title}${item.heading ? ` / ${item.heading}` : ''}: ${item.excerpt}${item.startOffset != null ? ` (offset ${item.startOffset}-${item.endOffset ?? item.startOffset})` : ''}`)
+            return `[^${id}]`
+          }).join(' ')
+          const bullet = (item: TopicWikiBullet): string => `- ${item.text} ${citation(item.evidence)}`.trim()
+          const relation = (item: TopicWikiRelation): string => `- ${item.label}: ${item.explanation} ${citation(item.evidence)}`.trim()
+          for (const item of [...content.keyPoints, ...content.openQuestions]) item.evidence.forEach((e) => sourceIds.add(e.materialId))
+          content.relations.forEach((item) => item.evidence.forEach((e) => sourceIds.add(e.materialId)))
+          const body = `# Summary\n\n${content.summary}\n\n# Key conclusions\n\n${content.keyPoints.map(bullet).join('\n') || '- None'}\n\n# Material relations\n\n${content.relations.map(relation).join('\n') || '- None'}\n\n# Open questions\n\n${content.openQuestions.map(bullet).join('\n') || '- None'}\n\n${[...footnotes].map(([id, text]) => `[^${id}]: ${text}`).join('\n')}\n`
+          const sources = JSON.stringify([...sourceIds].flatMap((id) => { const material = materials.find((item) => item.id === id); return material ? [{ id: `material-${id}`, resource: `/materials/${id}.md`, title: material.title }] : [] }))
+          write(topicPath, okfFrontmatter([
+            ['type', yamlScalar('Topic Wiki')], ['title', yamlScalar(topic.name)], ['description', yamlScalar(topic.description ?? '')], ['tags', yamlList(['topic-wiki'])],
+            ['sources', sources], ['generated', `{ by: ${yamlScalar(page.lastProvider ? `ai/${page.lastProvider}` : 'human:material-map')}, at: ${yamlScalar(page.updatedAt ?? topic.createdAt)} }`],
+            ['status', yamlScalar(status)], ['stale_after', stale ? yamlScalar(now()) : null], ['material_map_topic_id', yamlScalar(topic.id)], ['material_map_source_revision', String(page.sourceRevision ?? topic.revision)], ['material_map_wiki_version', String(page.version)], ['material_map_health', yamlList(page.checks)]
+          ]) + body)
+          topicPageCount += 1
+          topicEntries.push(`* [${topic.name.replace(/[\[\]]/g, '')}](/${topicPath}) - ${status}${topic.archivedAt ? ' (archived)' : ''}`)
+        } else topicEntries.push(`* ${topic.name.replace(/[\[\]]/g, '')} - no formal Wiki page`)
+        if (page.checks.length) warnings.push(`主题存在健康问题：${topic.name} (${page.checks.join(', ')})`)
+      }
+      const index = `---\nokf_version: 0.2\nokf_bundle_title: ${yamlScalar(this.config?.name ?? 'Material Map')}\n---\n\n# Topics\n\n${topicEntries.join('\n') || '- None'}\n\n# Materials\n\n${materialEntries.join('\n') || '- None'}\n`
+      write('index.md', index)
+      write('log.md', `# Export Log\n\n## ${now().slice(0, 10)}\n* **Export**: Material Map OKF v0.2 bundle generated.\n`)
+      await new Promise<void>((resolvePromise, reject) => { const stream = createWriteStream(destination); const archive = new ZipArchive({ zlib: { level: 8 } }); stream.on('close', resolvePromise); stream.on('error', reject); archive.on('error', reject); archive.pipe(stream); archive.directory(temp, false); void archive.finalize() })
+      return { destination, topicCount: topics.length, topicPageCount, materialCount: materials.length, copiedMaterialCount, unavailableMaterialCount, staleTopicCount, warnings: [...new Set(warnings)] }
+    } finally { await rm(temp, { recursive: true, force: true }) }
   }
   async exportPackage(destination: string): Promise<void> {
     const manifest = this.packageManifest()

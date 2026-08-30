@@ -188,6 +188,18 @@ export default function App(): React.ReactElement {
       setMessage(t('app.workspaceExported'))
     }
   }
+  const exportOkf = async () => {
+    if (!workspace) return
+    const warning = workspace.encrypted ? '此工作区已加密，OKF 包将包含可移植的明文材料副本。继续导出吗？' : 'OKF 包将包含当前工作区全部主题和材料副本，适合在确认安全的路径保存。继续导出吗？'
+    if (!window.confirm(warning)) return
+    const destination = await window.materialMap.saveOkf()
+    if (!destination) return
+    try {
+      const output = destination.toLowerCase().endsWith('.okf.zip') ? destination : `${destination}.okf.zip`
+      const summary = await window.materialMap.workspace.exportOkf(output) as { topicPageCount: number; materialCount: number; warnings?: string[] }
+      setMessage(`OKF 已导出：${summary.topicPageCount} 个主题页，${summary.materialCount} 份材料。${summary.warnings?.length ? `有 ${summary.warnings.length} 条警告。` : ''}`)
+    } catch (error) { setMessage(error instanceof Error ? `OKF 导出失败：${error.message}` : 'OKF 导出失败。') }
+  }
   const createDemo = async () => {
     try {
       const topic = await window.materialMap.demo.create() as Topic
@@ -298,6 +310,7 @@ export default function App(): React.ReactElement {
         onShowSources={() => setShowSources(true)}
         onShowSettings={() => setShowSettings(true)}
         onExportWorkspace={() => void exportWorkspace()}
+        onExportOkf={() => void exportOkf()}
       />
       <main
         className={`main${showChat && !activeTopic && !showExplorer ? ' knowledge-chat-main' : ''}`}

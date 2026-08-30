@@ -230,6 +230,12 @@ macOS 首次打开若出现安全提示，请在“系统设置 → 隐私与安
   <img src="./assets/screenshots/08-export-workspace.png" alt="Material Map 导出工作区" width="960" />
 </p>
 
+### 14. 导出 Open Knowledge Format
+
+在工作台侧边栏点击“导出 OKF”，可将整个工作区导出为 `.okf.zip`。导出包包含 OKF v0.2 的 `index.md`、主题 Wiki 页面、材料页面和可读取的原始材料副本；已归档、过期或需要复核的主题会保留状态标记，草稿不会导出。OKF 是交换格式，Material Map 仍以本地 SQLite 和结构化 Wiki 为准，不会改写原始材料。
+
+如果工作区已加密，导出前会提示：为了兼容其他 OKF 工具，包内原文件将以明文副本保存。
+
 ## 隐私和数据边界
 
 - 工作区数据库、索引、摘要和关系默认保存在本地。

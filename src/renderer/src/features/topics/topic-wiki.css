@@ -150,7 +150,7 @@
   .topic-wiki-navigation.mobile-open { transform: translateX(0); }
   .topic-wiki-navigation > header .topic-wiki-mobile-close,
   .topic-wiki-reader-toolbar .topic-wiki-navigation-toggle { display: inline-flex; }
-  .topic-wiki-evidence-panel { width: min(420px, 100%); }
+  .topic-wiki-evidence-panel { position: fixed; inset: 0 0 0 auto; z-index: 20; width: min(420px, 100vw); max-width: 100vw; }
   .topic-wiki-reader-toolbar { padding: 0 14px; }
 }
 

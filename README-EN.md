@@ -103,6 +103,12 @@ Use **Export workspace** to save a `.material-workspace` package. Import it from
 
 <p align="center"><img src="./assets/screenshots/08-export-workspace.png" alt="Material Map workspace export" width="960" /></p>
 
+### 9. Export Open Knowledge Format
+
+Choose **Export OKF** in the workbench sidebar to save the whole workspace as an `.okf.zip` bundle. The bundle contains OKF v0.2 `index.md`, Topic Wiki pages, material pages, and readable copies of available source materials. Archived, stale, or review-needed topics keep explicit status metadata; drafts are not exported. OKF is an interchange format: Material Map continues to use its local SQLite and structured Wiki as the source of truth and never rewrites original materials.
+
+Encrypted workspaces show an extra warning because source files are exported as readable copies for compatibility with other OKF tools.
+
 ## Privacy
 
 - Workspace databases, indexes, summaries, and relations are local by default.

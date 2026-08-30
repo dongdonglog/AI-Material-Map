@@ -44,11 +44,13 @@ function registerIpc(): void {
     return result.canceled ? null : (result.filePaths[0] ?? null)
   })
   ipcMain.handle('dialog:savePackage', async () => (await dialog.showSaveDialog({ defaultPath: 'workspace.material-workspace', filters: [{ name: 'Material Map workspace', extensions: ['material-workspace'] }] })).filePath ?? null)
+  ipcMain.handle('dialog:saveOkf', async () => (await dialog.showSaveDialog({ defaultPath: 'workspace.okf.zip', filters: [{ name: 'Open Knowledge Format bundle', extensions: ['okf.zip'] }] })).filePath ?? null)
   ipcMain.handle('workspace:create', async (_event, root: string, name: string, password?: string) => { const summary = await workspace.create(root, name, password); appStore.rememberWorkspace(summary.root, summary.name); return summary })
   ipcMain.handle('workspace:inspect', (_event, root: string) => workspace.inspectWorkspace(root))
   ipcMain.handle('workspace:inspectPackage', (_event, file: string) => workspace.inspectPackage(file))
   ipcMain.handle('workspace:open', async (_event, root: string, password?: string) => { const summary = await workspace.open(root, password); appStore.rememberWorkspace(summary.root, summary.name); return summary })
   ipcMain.handle('workspace:export', (_event, destination: string) => workspace.exportPackage(destination))
+  ipcMain.handle('workspace:exportOkf', (_event, destination: string) => workspace.exportOkfPackage(destination))
   ipcMain.handle('workspace:import', async (_event, file: string, destination: string, password?: string) => {
     const summary = await workspace.importPackage(file, destination, password)
     appStore.rememberWorkspace(summary.root, summary.name)

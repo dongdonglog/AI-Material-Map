@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { Archive, Bot, ChevronRight, FolderOpen, Map, Network, Plus, Search, Settings2, Trash2, Upload } from 'lucide-react'
+import { Archive, Bot, ChevronRight, FileArchive, FolderOpen, Map, Network, Plus, Search, Settings2, Trash2, Upload } from 'lucide-react'
 import type { Topic, Workspace } from '../types'
 import type { RecentWorkspace } from './Welcome'
 import { useI18n } from '../i18n'
@@ -27,9 +27,10 @@ export interface SidebarProps {
   onShowSources(): void
   onShowSettings(): void
   onExportWorkspace(): void
+  onExportOkf(): void
 }
 
-export function Sidebar({ workspace, recentWorkspaces, topics, archivedTopics, activeTopicId, showExplorer, showChat, onShowWorkbench, onShowExplorer, onShowChat, onOpenTopic, onNewTopic, onCreateWorkspace, onOpenWorkspace, onImportWorkspace, onOpenRecent, onCloseWorkspace, onRestoreTopic, onDeleteArchivedTopic, onShowSources, onShowSettings, onExportWorkspace }: SidebarProps): React.ReactElement {
+export function Sidebar({ workspace, recentWorkspaces, topics, archivedTopics, activeTopicId, showExplorer, showChat, onShowWorkbench, onShowExplorer, onShowChat, onOpenTopic, onNewTopic, onCreateWorkspace, onOpenWorkspace, onImportWorkspace, onOpenRecent, onCloseWorkspace, onRestoreTopic, onDeleteArchivedTopic, onShowSources, onShowSettings, onExportWorkspace, onExportOkf }: SidebarProps): React.ReactElement {
   const [showWorkspaceMenu, setShowWorkspaceMenu] = useState(false)
   const [showArchived, setShowArchived] = useState(false)
   const { t } = useI18n()
@@ -80,6 +81,7 @@ export function Sidebar({ workspace, recentWorkspaces, topics, archivedTopics, a
         <button className="nav-item" onClick={onShowSources}><FolderOpen size={17}/>{t('sidebar.sources')}</button>
         <button className="nav-item" onClick={onShowSettings}><Settings2 size={17}/>{t('sidebar.settings')}</button>
         <button className="nav-item" onClick={onExportWorkspace}><Upload size={17}/>{t('sidebar.exportWorkspace')}</button>
+        <button className="nav-item" onClick={onExportOkf}><FileArchive size={17}/>{t('sidebar.exportOkf')}</button>
       </div>
     </aside>
   )
